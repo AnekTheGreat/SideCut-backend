@@ -10,6 +10,8 @@ app.get("/", (req, res) => {
     res.send("SideCut backend is online!");
 });
 
+
+// Spotify metadata endpoint
 app.post("/metadata", async (req, res) => {
     const { url } = req.body;
 
@@ -21,7 +23,6 @@ app.post("/metadata", async (req, res) => {
     }
 
     try {
-        // Extract Spotify ID from link
         const match = url.match(
             /spotify\.com\/(track|album|playlist)\/([a-zA-Z0-9]+)/
         );
@@ -38,14 +39,21 @@ app.post("/metadata", async (req, res) => {
 
         res.json({
             success: true,
-            type,
-            id,
-            url,
-            message: "Spotify link received"
+            type: type,
+            id: id,
+
+            // Metadata placeholders
+            // These will be filled when a real metadata provider is connected
+            title: "Spotify Track",
+            artist: "Unknown Artist",
+            album: "Spotify",
+            artwork: "",
+
+            url: url
         });
 
     } catch (error) {
-        console.error(error);
+        console.error("Metadata error:", error);
 
         res.status(500).json({
             success: false,
@@ -53,6 +61,7 @@ app.post("/metadata", async (req, res) => {
         });
     }
 });
+
 
 const PORT = process.env.PORT || 3000;
 
