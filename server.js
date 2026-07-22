@@ -25,6 +25,8 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+const VR_UA = "com.google.android.apps.youtube.vr.oculus/1.56.21 (Linux; U; Android 11)";
+
 // ─── Spotify API ───
 const spotifyApi = new SpotifyWebApi({
   clientId: process.env.SPOTIFY_CLIENT_ID || "",
@@ -50,78 +52,59 @@ function downloadFile(url, dest) {
   });
 }
 
-// Download audio from YouTube to a temp file (direct download works, URL extraction doesn't)
-async function downloadYouTubeAudio(videoUrl, outputFile) {
-  // Method 1: system yt-dlp binary (fastest, handles bot detection internally)
+// ─── PRIMARY: YouTube internal player API (ANDROID_VR client — bypasses bot detection) ───
+async function getAudioUrlFromPlayerApi(videoId) {
+  try {
+    console.log("Trying YouTube player API (ANDROID_VR)...");
+    const body = JSON.stringify({
+      videoId,
+      context: { client: { clientName: "ANDROID_VR", clientVersion: "1.56.21", hl: "en", gl: "US" } },
+    });
+    const resp = await fetch("https://www.youtube.com/youtubei/v1/player?prettyPrint=false", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "User-Agent": VR_UA },
+      body,
+    });
+    const data = await resp.json();
+    const formats = data?.streamingData?.adaptiveFormats || [];
+    const audioFormats = formats.filter((f) => f.mimeType?.includes("audio"));
+    if (audioFormats.length === 0) {
+      console.log("✗ Player API: no audio formats, status:", data?.playabilityStatus?.status);
+      return null;
+    }
+    const best = audioFormats.reduce((a, b) => (b.bitrate || 0) > (a.bitrate || 0) ? b : a);
+    console.log(`✓ Player API: got audio URL (${best.mimeType}, ${best.bitrate}bps)`);
+    return best.url;
+  } catch (e) {
+    console.log("✗ Player API failed:", e.message);
+    return null;
+  }
+}
+
+// ─── FALLBACK 1: system yt-dlp direct download to temp file ───
+async function downloadWithYtDlp(videoUrl, outputFile) {
   try {
     console.log("Trying system yt-dlp...");
-    const args = [
-      "-x", "--audio-format", "mp3", "--audio-quality", "5",
-      "-o", outputFile, "--no-playlist", "--no-warnings",
-      "--no-check-certificates",
-    ];
+    const args = ["-x", "--audio-format", "mp3", "--audio-quality", "5", "-o", outputFile, "--no-playlist", "--no-warnings", "--no-check-certificates"];
     if (ffmpegPath) args.push("--ffmpeg-location", ffmpegPath);
     args.push(videoUrl);
     await execFileAsync("yt-dlp", args, { timeout: 90000 });
-    if (fs.existsSync(outputFile) && fs.statSync(outputFile).size > 1000) {
-      console.log("✓ yt-dlp download succeeded");
-      return;
-    }
+    if (fs.existsSync(outputFile) && fs.statSync(outputFile).size > 1000) { console.log("✓ yt-dlp succeeded"); return true; }
   } catch (e) { console.log("✗ yt-dlp failed:", e.message); }
-
-  // Method 2: youtube-dl-exec npm package
-  if (youtubedl) {
-    try {
-      console.log("Trying youtube-dl-exec...");
-      const opts = {
-        extractAudio: true, audioFormat: "mp3", audioQuality: 5,
-        output: outputFile, noPlaylist: true, noWarnings: true,
-      };
-      if (ffmpegPath) opts.ffmpegLocation = ffmpegPath;
-      await youtubedl(videoUrl, opts);
-      if (fs.existsSync(outputFile) && fs.statSync(outputFile).size > 1000) {
-        console.log("✓ youtube-dl-exec download succeeded");
-        return;
-      }
-    } catch (e) { console.log("✗ youtube-dl-exec failed:", e.message); }
-  }
-
-  // Method 3: ytdl-core + fluent-ffmpeg (stream to file)
-  if (ytdl && ffmpeg) {
-    try {
-      console.log("Trying ytdl-core + ffmpeg...");
-      const audioStream = ytdl(videoUrl, { quality: "highestaudio", filter: "audioonly" });
-      await new Promise((resolve, reject) => {
-        ffmpeg(audioStream).toFormat("mp3").audioBitrate(192).save(outputFile).on("end", resolve).on("error", reject);
-      });
-      if (fs.existsSync(outputFile) && fs.statSync(outputFile).size > 1000) {
-        console.log("✓ ytdl-core + ffmpeg succeeded");
-        return;
-      }
-    } catch (e) { console.log("✗ ytdl-core failed:", e.message); }
-  }
-
-  throw new Error("All download methods failed — YouTube may be blocking this server");
+  return false;
 }
 
-// Add metadata + album art to an MP3 file
-function tagMp3(inputFile, outputFile, metadata, artworkPath) {
-  return new Promise((resolve, reject) => {
-    if (!ffmpeg) { fs.copyFileSync(inputFile, outputFile); resolve(); return; }
-    let cmd = ffmpeg().input(inputFile);
-    if (artworkPath && fs.existsSync(artworkPath)) cmd = cmd.input(artworkPath);
-    const opts = [
-      "-metadata", `title=${metadata.title}`,
-      "-metadata", `artist=${metadata.artist}`,
-      "-metadata", `album=${metadata.album}`,
-      "-metadata", `comment=Downloaded via SideCut`,
-    ];
-    if (artworkPath && fs.existsSync(artworkPath)) {
-      opts.push("-map", "0:a", "-map", "1:v", "-c:v", "mjpeg", "-disposition:v:0", "attached_pic");
-    }
-    cmd.toFormat("mp3").audioBitrate(192).outputOptions(opts).save(outputFile)
-      .on("end", resolve).on("error", reject);
-  });
+// ─── FALLBACK 2: youtube-dl-exec npm package ───
+async function downloadWithNpm(videoUrl, outputFile) {
+  if (!youtubedl) return false;
+  try {
+    console.log("Trying youtube-dl-exec...");
+    const opts = { extractAudio: true, audioFormat: "mp3", audioQuality: 5, output: outputFile, noPlaylist: true, noWarnings: true };
+    if (ffmpegPath) opts.ffmpegLocation = ffmpegPath;
+    await youtubedl(videoUrl, opts);
+    if (fs.existsSync(outputFile) && fs.statSync(outputFile).size > 1000) { console.log("✓ youtube-dl-exec succeeded"); return true; }
+  } catch (e) { console.log("✗ youtube-dl-exec failed:", e.message); }
+  return false;
 }
 
 // ─── Routes ───
@@ -165,7 +148,7 @@ app.post("/metadata", async (req, res) => {
 app.post("/download", async (req, res) => {
   const { url } = req.body;
   if (!url) return res.status(400).json({ success: false, error: "No URL provided" });
-  let artworkPath = null, rawFile = null, taggedFile = null;
+  let artworkPath = null, tempFile = null;
 
   try {
     const match = url.match(/spotify\.com\/(track|album|playlist)\/([a-zA-Z0-9]+)/);
@@ -188,37 +171,86 @@ app.post("/download", async (req, res) => {
     if (!video) return res.status(404).json({ success: false, error: "No matching audio found on YouTube" });
     console.log(`Found: ${video.title}`);
 
+    const videoId = video.videoId || (video.url && video.url.split("v=")[1]?.split("&")[0]);
+    if (!videoId) return res.status(500).json({ success: false, error: "Could not extract video ID" });
+
     // 3. Download album art
     if (artworkUrl) {
       try { artworkPath = `/tmp/artwork_${id}.jpg`; await downloadFile(artworkUrl, artworkPath); } catch (e) { artworkPath = null; }
     }
 
-    // 4. Download audio to temp file
-    rawFile = `/tmp/sidecut_raw_${id}.mp3`;
-    taggedFile = `/tmp/sidecut_tagged_${id}.mp3`;
+    // 4. Get audio URL via YouTube player API (ANDROID_VR — bypasses bot detection)
+    const audioUrl = await getAudioUrlFromPlayerApi(videoId);
 
-    await downloadYouTubeAudio(video.url, rawFile);
-    console.log(`Downloaded: ${fs.statSync(rawFile).size} bytes`);
+    if (audioUrl && ffmpeg) {
+      // ─── STREAMING: pipe audio URL → ffmpeg → MP3 → response ───
+      console.log("Streaming via ffmpeg...");
+      const safeFileName = `${artistName} - ${trackName}`.replace(/[^\w\s\-]/g, "_").trim();
+      res.setHeader("Content-Type", "audio/mpeg");
+      res.setHeader("Content-Disposition", `attachment; filename="${safeFileName}.mp3"`);
 
-    // 5. Add metadata + album art
-    try {
-      await tagMp3(rawFile, taggedFile, { title: trackName, artist: artistName, album: albumName }, artworkPath);
-      console.log("Tagged with metadata + artwork");
-    } catch (e) {
-      console.warn("Tagging failed, using raw:", e.message);
-      fs.copyFileSync(rawFile, taggedFile);
+      let ff = ffmpeg()
+        .input(audioUrl)
+        .inputOptions([
+          "-user_agent", VR_UA,
+          "-headers", "Referer: https://www.youtube.com\r\n",
+        ])
+        .format("mp3")
+        .audioBitrate(192)
+        .outputOptions([
+          "-metadata", `title=${trackName}`,
+          "-metadata", `artist=${artistName}`,
+          "-metadata", `album=${albumName}`,
+          "-metadata", `comment=Downloaded via SideCut`,
+        ]);
+
+      if (artworkPath && fs.existsSync(artworkPath)) {
+        ff = ff.input(artworkPath).outputOptions(["-map", "0:a", "-map", "1:v", "-c:v", "mjpeg", "-disposition:v:0", "attached_pic"]);
+      }
+
+      const proc = ff.on("error", (err) => {
+        console.error("FFmpeg error:", err.message);
+        if (!res.headersSent) res.status(500).json({ success: false, error: "Conversion failed: " + err.message });
+        cleanup();
+      }).on("end", () => { console.log(`✓ Done: ${trackName}`); cleanup(); });
+
+      proc.pipe(res);
+      req.on("close", () => { try { proc.kill(); } catch (e) {} cleanup(); });
+
+    } else {
+      // ─── FALLBACK: download to temp file, then stream ───
+      console.log("Player API failed, falling back to yt-dlp...");
+      tempFile = `/tmp/sidecut_${id}.mp3`;
+      let ok = await downloadWithYtDlp(video.url, tempFile);
+      if (!ok) ok = await downloadWithNpm(video.url, tempFile);
+      if (!ok) {
+        return res.status(502).json({ success: false, error: "Could not download audio — YouTube may be blocking this server" });
+      }
+
+      // Add metadata with ffmpeg
+      if (ffmpeg && artworkPath && fs.existsSync(artworkPath)) {
+        const tagged = `/tmp/sidecut_tagged_${id}.mp3`;
+        try {
+          await new Promise((resolve, reject) => {
+            ffmpeg().input(tempFile).input(artworkPath)
+              .outputOptions(["-map", "0:a", "-map", "1:v", "-c:v", "mjpeg", "-disposition:v:0", "attached_pic",
+                "-metadata", `title=${trackName}`, "-metadata", `artist=${artistName}`, "-metadata", `album=${albumName}`])
+              .toFormat("mp3").audioBitrate(192).save(tagged).on("end", resolve).on("error", reject);
+          });
+          fs.unlinkSync(tempFile);
+          tempFile = tagged;
+        } catch (e) { console.warn("Tagging failed:", e.message); }
+      }
+
+      const safeFileName = `${artistName} - ${trackName}`.replace(/[^\w\s\-]/g, "_").trim();
+      res.setHeader("Content-Type", "audio/mpeg");
+      res.setHeader("Content-Disposition", `attachment; filename="${safeFileName}.mp3"`);
+      const stream = fs.createReadStream(tempFile);
+      stream.pipe(res);
+      stream.on("end", cleanup);
+      stream.on("error", cleanup);
+      req.on("close", cleanup);
     }
-
-    // 6. Stream to client
-    const safeFileName = `${artistName} - ${trackName}`.replace(/[^\w\s\-]/g, "_").trim();
-    res.setHeader("Content-Type", "audio/mpeg");
-    res.setHeader("Content-Disposition", `attachment; filename="${safeFileName}.mp3"`);
-
-    const fileStream = fs.createReadStream(taggedFile);
-    fileStream.pipe(res);
-    fileStream.on("end", () => cleanup());
-    fileStream.on("error", () => { if (!res.headersSent) res.status(500).json({ success: false, error: "Stream error" }); cleanup(); });
-    req.on("close", () => cleanup());
 
   } catch (error) {
     console.error("Download error:", error.message);
@@ -227,7 +259,7 @@ app.post("/download", async (req, res) => {
   }
 
   function cleanup() {
-    [artworkPath, rawFile, taggedFile].forEach((f) => { try { if (f && fs.existsSync(f)) fs.unlinkSync(f); } catch (e) {} });
+    [artworkPath, tempFile].forEach((f) => { try { if (f && fs.existsSync(f)) fs.unlinkSync(f); } catch (e) {} });
   }
 });
 
