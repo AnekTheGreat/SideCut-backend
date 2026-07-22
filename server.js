@@ -2,21 +2,48 @@ const express = require("express");
 const cors = require("cors");
 const https = require("https");
 const fs = require("fs");
+const { execFile } = require("child_process");
+const { promisify } = require("util");
+const execFileAsync = promisify(execFile);
 const SpotifyWebApi = require("spotify-web-api-node");
 const ytSearch = require("yt-search");
-const ytdl = require("@distube/ytdl-core");
-const ffmpeg = require("fluent-ffmpeg");
-const ffmpegPath = require("ffmpeg-static");
 
-ffmpeg.setFfmpegPath(ffmpegPath);
+// â”€â”€â”€ Load YouTube download libraries (any one of these will work) â”€â”€â”€
+
+let youtubedl = null;
+try {
+  youtubedl = require("youtube-dl-exec");
+  console.log("âœ“ youtube-dl-exec loaded");
+} catch (e) {
+  console.log("âœ— youtube-dl-exec not available");
+}
+
+let ytdl = null;
+try {
+  ytdl = require("@distube/ytdl-core");
+  console.log("âœ“ @distube/ytdl-core loaded");
+} catch (e) {
+  console.log("âœ— @distube/ytdl-core not available");
+}
+
+let ffmpeg = null;
+try {
+  ffmpeg = require("fluent-ffmpeg");
+  const fp = require("ffmpeg-static");
+  ffmpeg.setFfmpegPath(fp);
+  console.log("âœ“ ffmpeg-static loaded");
+} catch (e) {
+  console.log("âœ— ffmpeg not available");
+}
+
+// â”€â”€â”€ Express setup â”€â”€â”€
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-/* â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-   Spotify API â€” client-credentials flow (no user login needed)
-   â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+// â”€â”€â”€ Spotify API (client-credentials flow, no user login) â”€â”€â”€
+
 const spotifyApi = new SpotifyWebApi({
   clientId: process.env.SPOTIFY_CLIENT_ID || "",
   clientSecret: process.env.SPOTIFY_CLIENT_SECRET || "",
@@ -34,9 +61,8 @@ async function ensureSpotifyToken() {
   tokenExpiry = Date.now() + (data.body.expires_in - 60) * 1000;
 }
 
-/* â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-   Helper â€” download a file over HTTPS (for album art)
-   â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+// â”€â”€â”€ Helper: download a file over HTTPS (for album art) â”€â”€â”€
+
 function downloadFile(url, dest) {
   return new Promise((resolve, reject) => {
     const file = fs.createWriteStream(dest);
@@ -60,9 +86,118 @@ function downloadFile(url, dest) {
   });
 }
 
-/* â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-   Health check
-   â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+// â”€â”€â”€ YouTube audio download (tries multiple methods) â”€â”€â”€
+
+async function downloadYouTubeAudio(videoUrl, outputFile) {
+  // Method 1: youtube-dl-exec (npm package that bundles yt-dlp binary)
+  if (youtubedl) {
+    try {
+      console.log("Trying youtube-dl-exec...");
+      await youtubedl(videoUrl, {
+        extractAudio: true,
+        audioFormat: "mp3",
+        audioQuality: 0,
+        output: outputFile,
+        noPlaylist: true,
+        noWarnings: true,
+      });
+      if (fs.existsSync(outputFile) && fs.statSync(outputFile).size > 1000) {
+        console.log("âœ“ youtube-dl-exec succeeded");
+        return;
+      }
+    } catch (e) {
+      console.log("âœ— youtube-dl-exec failed:", e.message);
+    }
+  }
+
+  // Method 2: yt-dlp via child_process (if installed as system binary)
+  try {
+    console.log("Trying yt-dlp binary...");
+    await execFileAsync("yt-dlp", [
+      "-x", "--audio-format", "mp3", "--audio-quality", "0",
+      "-o", outputFile, "--no-playlist", "--no-warnings",
+      videoUrl,
+    ], { timeout: 120000 });
+    if (fs.existsSync(outputFile) && fs.statSync(outputFile).size > 1000) {
+      console.log("âœ“ yt-dlp binary succeeded");
+      return;
+    }
+  } catch (e) {
+    console.log("âœ— yt-dlp binary failed:", e.message);
+  }
+
+  // Method 3: @distube/ytdl-core + fluent-ffmpeg (stream-based)
+  if (ytdl && ffmpeg) {
+    try {
+      console.log("Trying ytdl-core + ffmpeg...");
+      const audioStream = ytdl(videoUrl, {
+        quality: "highestaudio",
+        filter: "audioonly",
+      });
+
+      await new Promise((resolve, reject) => {
+        ffmpeg(audioStream)
+          .toFormat("mp3")
+          .audioBitrate(320)
+          .save(outputFile)
+          .on("end", resolve)
+          .on("error", reject);
+      });
+
+      if (fs.existsSync(outputFile) && fs.statSync(outputFile).size > 1000) {
+        console.log("âœ“ ytdl-core + ffmpeg succeeded");
+        return;
+      }
+    } catch (e) {
+      console.log("âœ— ytdl-core + ffmpeg failed:", e.message);
+    }
+  }
+
+  throw new Error("All download methods failed");
+}
+
+// â”€â”€â”€ Helper: add metadata + album art to an MP3 file â”€â”€â”€
+
+function tagMp3(inputFile, outputFile, metadata, artworkPath) {
+  return new Promise((resolve, reject) => {
+    if (!ffmpeg) {
+      // No ffmpeg available â€” just copy the file as-is
+      fs.copyFileSync(inputFile, outputFile);
+      resolve();
+      return;
+    }
+
+    let cmd = ffmpeg().input(inputFile);
+
+    if (artworkPath && fs.existsSync(artworkPath)) {
+      cmd = cmd.input(artworkPath);
+    }
+
+    const opts = [];
+    if (artworkPath && fs.existsSync(artworkPath)) {
+      opts.push("-map", "0:a", "-map", "1:v");
+      opts.push("-c:v", "mjpeg");
+      opts.push("-disposition:v:0", "attached_pic");
+    }
+    opts.push(
+      "-metadata", `title=${metadata.title}`,
+      "-metadata", `artist=${metadata.artist}`,
+      "-metadata", `album=${metadata.album}`,
+      "-metadata", `comment=Downloaded via SideCut`,
+    );
+
+    cmd
+      .toFormat("mp3")
+      .audioBitrate(320)
+      .outputOptions(opts)
+      .save(outputFile)
+      .on("end", resolve)
+      .on("error", reject);
+  });
+}
+
+// â”€â”€â”€ Routes â”€â”€â”€
+
 app.get("/", (req, res) => {
   res.send("SideCut backend is online!");
 });
@@ -74,9 +209,20 @@ app.get("/health", (req, res) => {
   });
 });
 
-/* â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-   /metadata  â€”  read real track info from Spotify
-   â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+app.get("/debug", (req, res) => {
+  res.json({
+    youtube_dl_exec: !!youtubedl,
+    ytdl_core: !!ytdl,
+    ffmpeg: !!ffmpeg,
+    spotify_client_id_set: !!process.env.SPOTIFY_CLIENT_ID,
+    spotify_client_secret_set: !!process.env.SPOTIFY_CLIENT_SECRET,
+    node_version: process.version,
+    platform: process.platform,
+  });
+});
+
+// â”€â”€â”€ /metadata â€” fetch real track info from Spotify â”€â”€â”€
+
 app.post("/metadata", async (req, res) => {
   const { url } = req.body;
 
@@ -150,14 +296,13 @@ app.post("/metadata", async (req, res) => {
       success: false,
       error: error.message.includes("Spotify credentials")
         ? "Server not configured with Spotify API credentials"
-        : "Failed to fetch metadata",
+        : "Failed to fetch metadata: " + error.message,
     });
   }
 });
 
-/* â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-   /download  â€”  search YouTube, stream back MP3
-   â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+// â”€â”€â”€ /download â€” search YouTube, download audio, stream MP3 back â”€â”€â”€
+
 app.post("/download", async (req, res) => {
   const { url } = req.body;
 
@@ -165,9 +310,9 @@ app.post("/download", async (req, res) => {
     return res.status(400).json({ success: false, error: "No URL provided" });
   }
 
-  let audioStream = null;
-  let ffmpegProcess = null;
   let artworkPath = null;
+  let rawAudioFile = null;
+  let taggedFile = null;
 
   try {
     const match = url.match(
@@ -184,11 +329,11 @@ app.post("/download", async (req, res) => {
     if (type !== "track") {
       return res.status(400).json({
         success: false,
-        error: "Only individual tracks are supported for download right now",
+        error: "Only individual tracks are supported for download",
       });
     }
 
-    // 1. Get real track metadata from Spotify
+    // 1. Get track metadata from Spotify
     await ensureSpotifyToken();
     const trackData = await spotifyApi.getTrack(id);
     const track = trackData.body;
@@ -214,101 +359,90 @@ app.post("/download", async (req, res) => {
 
     console.log(`Found: ${video.title} â†’ ${video.url}`);
 
-    // 3. Download album art (best-effort, non-blocking on failure)
+    // 3. Download album art from Spotify (best-effort)
     if (artworkUrl) {
       try {
         artworkPath = `/tmp/artwork_${id}.jpg`;
         await downloadFile(artworkUrl, artworkPath);
         console.log("Album art downloaded");
       } catch (e) {
-        console.warn("Album art download failed:", e.message);
+        console.warn("Album art failed:", e.message);
         artworkPath = null;
       }
     }
 
-    // 4. Get audio stream from YouTube
-    audioStream = ytdl(video.url, {
-      quality: "highestaudio",
-      filter: "audioonly",
-    });
+    // 4. Download audio from YouTube to a temp file
+    rawAudioFile = `/tmp/sidecut_raw_${id}.mp3`;
+    taggedFile = `/tmp/sidecut_tagged_${id}.mp3`;
 
-    // 5. Set response headers
+    await downloadYouTubeAudio(video.url, rawAudioFile);
+    console.log(`Audio downloaded: ${fs.statSync(rawAudioFile).size} bytes`);
+
+    // 5. Add metadata + album art
+    const metadata = { title: trackName, artist: artistName, album: albumName };
+
+    try {
+      await tagMp3(rawAudioFile, taggedFile, metadata, artworkPath);
+      console.log("Metadata embedded");
+    } catch (e) {
+      console.warn("Tagging failed, using raw file:", e.message);
+      fs.copyFileSync(rawAudioFile, taggedFile);
+    }
+
+    // 6. Stream the MP3 to the client
     const safeFileName = `${artistName} - ${trackName}`
       .replace(/[^\w\s\-]/g, "_")
       .trim();
+
     res.setHeader("Content-Type", "audio/mpeg");
     res.setHeader(
       "Content-Disposition",
       `attachment; filename="${safeFileName}.mp3"`
     );
 
-    // 6. Build ffmpeg command â€” convert to MP3 with embedded metadata + album art
-    let ffCommand = ffmpeg(audioStream);
+    const fileStream = fs.createReadStream(taggedFile);
+    fileStream.pipe(res);
 
-    if (artworkPath) {
-      ffCommand = ffCommand.input(artworkPath);
-    }
+    fileStream.on("end", () => {
+      cleanup(id);
+    });
 
-    const outputOptions = [];
+    fileStream.on("error", (err) => {
+      console.error("Stream error:", err.message);
+      cleanup(id);
+      if (!res.headersSent) {
+        res.status(500).json({ success: false, error: "Stream error" });
+      }
+    });
 
-    if (artworkPath) {
-      outputOptions.push("-map", "0:a", "-map", "1:v");
-      outputOptions.push("-c:v", "mjpeg");
-      outputOptions.push("-disposition:v:0", "attached_pic");
-    }
-
-    outputOptions.push(
-      "-metadata", `title=${trackName}`,
-      "-metadata", `artist=${artistName}`,
-      "-metadata", `album=${albumName}`,
-      "-metadata", `date=${track.album.release_date?.split("-")[0] || ""}`,
-      "-metadata", `comment=Downloaded via SideCut`,
-    );
-
-    ffmpegProcess = ffCommand
-      .toFormat("mp3")
-      .audioBitrate(320)
-      .outputOptions(outputOptions)
-      .on("error", (err) => {
-        console.error("FFmpeg error:", err.message);
-        if (!res.headersSent) {
-          res.status(500).json({
-            success: false,
-            error: "Audio conversion failed",
-          });
-        }
-      })
-      .on("end", () => {
-        console.log(`Finished converting: ${trackName}`);
-        if (artworkPath) fs.unlink(artworkPath, () => {});
-      });
-
-    // 7. Pipe the MP3 stream to the client
-    ffmpegProcess.pipe(res);
-
-    // 8. Clean up if the client disconnects early
+    // Clean up if client disconnects early
     req.on("close", () => {
-      if (audioStream) audioStream.destroy();
-      try {
-        if (ffmpegProcess) ffmpegProcess.kill();
-      } catch (e) {}
-      if (artworkPath) fs.unlink(artworkPath, () => {});
+      cleanup(id);
     });
   } catch (error) {
     console.error("Download error:", error.message);
-    if (audioStream) audioStream.destroy();
-    try {
-      if (ffmpegProcess) ffmpegProcess.kill();
-    } catch (e) {}
-    if (artworkPath) fs.unlink(artworkPath, () => {});
+    cleanup(id || "unknown");
     if (!res.headersSent) {
       res.status(500).json({
         success: false,
         error: error.message.includes("Spotify credentials")
           ? "Server not configured with Spotify API credentials"
-          : "Server error",
+          : "Download failed: " + error.message,
       });
     }
+  }
+
+  function cleanup(trackId) {
+    const files = [
+      `/tmp/artwork_${trackId}.jpg`,
+      `/tmp/sidecut_raw_${trackId}.mp3`,
+      `/tmp/sidecut_tagged_${trackId}.mp3`,
+    ];
+    files.forEach((f) => {
+      try {
+        if (fs.existsSync(f)) fs.unlinkSync(f);
+      } catch (e) {}
+    });
   }
 });
 
