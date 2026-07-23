@@ -1,10 +1,8 @@
 const express = require("express");
 const cors = require("cors");
 const https = require("https");
-const http = require("http");
 const fs = require("fs");
-const path = require("path");
-const { execFile, spawn } = require("child_process");
+const { execFile } = require("child_process");
 const { promisify } = require("util");
 const execFileAsync = promisify(execFile);
 const SpotifyWebApi = require("spotify-web-api-node");
@@ -18,6 +16,104 @@ try {
   ffmpegPath = require("ffmpeg-static");
   ffmpeg.setFfmpegPath(ffmpegPath);
 } catch (e) {}
+
+// ─── PO Token Generator ───
+let bgUtils = null;
+let jsdomReady = false;
+let cachedPoToken = null;
+let poTokenExpiry = 0;
+
+async function setupJSDOM() {
+  if (jsdomReady) return;
+  const { JSDOM } = require("jsdom");
+  const dom = new JSDOM('<!DOCTYPE html><html><body></body></html>', { url: "https://www.youtube.com/" });
+  Object.assign(globalThis, { window: dom.window, document: dom.window.document, location: dom.window.location });
+  if (!globalThis.navigator) Object.defineProperty(globalThis, "navigator", { value: dom.window.navigator });
+  jsdomReady = true;
+}
+
+async function loadBgUtils() {
+  if (bgUtils) return bgUtils;
+  bgUtils = {
+    botguard: await import("bgutils-js/botguard"),
+    webpo: await import("bgutils-js/webpo"),
+    utils: await import("bgutils-js/utils"),
+  };
+  return bgUtils;
+}
+
+function fetchFn(url, options = {}) {
+  const method = (options.method || "GET").toUpperCase();
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const req = https.request({ hostname: parsed.hostname, path: parsed.pathname + parsed.search, method, headers: options.headers || {} }, (res) => {
+      let data = "";
+      res.on("data", c => data += c);
+      res.on("end", () => resolve({ ok: res.statusCode >= 200, json: async () => JSON.parse(data), text: async () => data }));
+    });
+    req.on("error", reject);
+    if (options.body) req.write(options.body);
+    req.end();
+  });
+}
+
+async function generatePoToken() {
+  if (cachedPoToken && Date.now() < poTokenExpiry) return cachedPoToken;
+  
+  try {
+    console.log("Generating PO Token...");
+    await setupJSDOM();
+    const { botguard, webpo, utils } = await loadBgUtils();
+    const { Innertube } = require("youtubei.js");
+    const origWarn = console.warn;
+    console.warn = () => {};
+
+    // 1. Get visitor data
+    const yt = await Innertube.create({ retrieve_player: false });
+    const contentBinding = yt.session.context.client.visitorData;
+
+    // 2. Get BotGuard challenge
+    const attResp = await fetchFn("https://www.youtube.com/youtubei/v1/att/get?prettyPrint=false", {
+      method: "POST",
+      headers: { ...utils.getHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ context: { client: { clientName: "WEB", clientVersion: "2.20260227.01.00" } }, engagementType: "ENGAGEMENT_TYPE_UNBOUND" }),
+    });
+    const challenge = (await attResp.json()).bgChallenge;
+
+    // 3. Execute interpreter
+    const interpResp = await fetchFn("https:" + challenge.interpreterUrl.privateDoNotAccessOrElseTrustedResourceUrlWrappedValue);
+    new Function(await interpResp.text())();
+
+    // 4. BotGuard snapshot
+    const bgClient = await botguard.BotGuardClient.create({ program: challenge.program, globalName: challenge.globalName, globalObject: globalThis });
+    const webPoSignalOutput = [];
+    const bgResponse = await bgClient.snapshot({ webPoSignalOutput });
+
+    // 5. Get integrity token
+    const itResp = await fetchFn(utils.buildURL("GenerateIT"), {
+      method: "POST", headers: utils.getHeaders(),
+      body: JSON.stringify(["O43z0dpjhgX20SCx4KAo", bgResponse]),
+    });
+    const [integrityToken, ttl, refreshThreshold, fallback] = await itResp.json();
+    if (!integrityToken) throw new Error("Empty integrity token");
+
+    // 6. Mint PO token
+    const minter = await webpo.WebPoMinter.create({ integrityToken, estimatedTtlSecs: ttl, mintRefreshThreshold: refreshThreshold, websafeFallbackToken: fallback }, webPoSignalOutput);
+    const poToken = await minter.mintAsWebsafeString(contentBinding);
+    
+    console.warn = origWarn;
+    if (!poToken) throw new Error("Empty PO token");
+    console.log(`✓ PO Token generated (TTL: ${ttl}s): ${poToken.substring(0, 30)}...`);
+    
+    cachedPoToken = poToken;
+    poTokenExpiry = Date.now() + Math.min(ttl - 300, 6 * 3600) * 1000;
+    return poToken;
+  } catch (e) {
+    console.warn = origWarn || console.warn;
+    console.log("✗ PO Token failed:", e.message);
+    return null;
+  }
+}
 
 const app = express();
 app.use(cors());
@@ -47,110 +143,12 @@ function downloadFile(url, dest) {
   });
 }
 
-// ─── Cookies ───
 let cookieFilePath = null;
 function getCookieFile() {
   if (cookieFilePath && fs.existsSync(cookieFilePath)) return cookieFilePath;
-  if (process.env.YOUTUBE_COOKIE_FILE && fs.existsSync(process.env.YOUTUBE_COOKIE_FILE)) {
-    cookieFilePath = process.env.YOUTUBE_COOKIE_FILE; return cookieFilePath;
-  }
-  if (process.env.YOUTUBE_COOKIES) {
-    cookieFilePath = "/tmp/yt_cookies.txt";
-    fs.writeFileSync(cookieFilePath, process.env.YOUTUBE_COOKIES);
-    return cookieFilePath;
-  }
+  if (process.env.YOUTUBE_COOKIE_FILE && fs.existsSync(process.env.YOUTUBE_COOKIE_FILE)) { cookieFilePath = process.env.YOUTUBE_COOKIE_FILE; return cookieFilePath; }
+  if (process.env.YOUTUBE_COOKIES) { cookieFilePath = "/tmp/yt_cookies.txt"; fs.writeFileSync(cookieFilePath, process.env.YOUTUBE_COOKIES); return cookieFilePath; }
   return null;
-}
-
-// ─── Find Chrome for the PO Token provider ───
-function findChromePath() {
-  // Check env var
-  if (process.env.CHROME_PATH && fs.existsSync(process.env.CHROME_PATH)) return process.env.CHROME_PATH;
-  // Puppeteer's Chrome
-  try {
-    const puppeteer = require("puppeteer");
-    const p = puppeteer.executablePath();
-    if (p && fs.existsSync(p)) return p;
-  } catch (e) {}
-  // Puppeteer cache
-  const home = process.env.HOME || "/root";
-  const cacheDir = path.join(home, ".cache", "puppeteer", "chrome");
-  try {
-    if (fs.existsSync(cacheDir)) {
-      const versions = fs.readdirSync(cacheDir);
-      for (const v of versions) {
-        const chromePath = path.join(cacheDir, v, "chrome-linux64", "chrome");
-        if (fs.existsSync(chromePath)) return chromePath;
-      }
-    }
-  } catch (e) {}
-  // System
-  for (const p of ["/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome"]) {
-    if (fs.existsSync(p)) return p;
-  }
-  return null;
-}
-
-// ─── PO Token Provider (bgutil HTTP server) ───
-let potProviderReady = false;
-
-async function checkPotProvider() {
-  return new Promise((resolve) => {
-    const req = http.get("http://127.0.0.1:4416/ping", (res) => {
-      res.on("data", () => {});
-      res.on("end", () => resolve(res.statusCode === 200));
-    });
-    req.on("error", () => resolve(false));
-    req.setTimeout(3000, () => { req.destroy(); resolve(false); });
-  });
-}
-
-async function startPotProvider() {
-  if (await checkPotProvider()) {
-    console.log("✓ PO Token provider already running");
-    potProviderReady = true;
-    return true;
-  }
-
-  // Find the provider server
-  const home = process.env.HOME || "/root";
-  const providerDir = path.join(home, "bgutil-ytdlp-pot-provider", "server");
-  const serverJs = path.join(providerDir, "build", "main.js");
-  
-  if (!fs.existsSync(serverJs)) {
-    console.log("⚠ bgutil provider not found at", serverJs);
-    return false;
-  }
-
-  const chrome = findChromePath();
-  console.log(`Starting PO Token provider... Chrome: ${chrome || "not found"}`);
-  
-  const env = { ...process.env };
-  if (chrome) env.CHROME_PATH = chrome;
-
-  try {
-    const provider = spawn("node", [serverJs], {
-      env, stdio: ["ignore", "pipe", "pipe"], detached: false, cwd: providerDir,
-    });
-    provider.stdout.on("data", (d) => console.log(`  [POT] ${d.toString().trim()}`));
-    provider.stderr.on("data", (d) => console.log(`  [POT] ${d.toString().trim()}`));
-    provider.on("error", (e) => console.log(`  [POT] Start failed: ${e.message}`));
-    provider.on("exit", (code) => console.log(`  [POT] Exited: ${code}`));
-
-    for (let i = 0; i < 20; i++) {
-      await new Promise(r => setTimeout(r, 2000));
-      if (await checkPotProvider()) {
-        console.log("✓ PO Token provider ready");
-        potProviderReady = true;
-        return true;
-      }
-    }
-    console.log("⚠ PO Token provider didn't start in time");
-    return false;
-  } catch (e) {
-    console.log("⚠ PO Token provider error:", e.message);
-    return false;
-  }
 }
 
 // ─── Run yt-dlp ───
@@ -165,45 +163,55 @@ async function runYtDlp(args, timeout = 120000) {
 // ─── Download audio ───
 async function tryDownload(videoUrl, outputFile) {
   const cookieFile = getCookieFile();
+  const poToken = await generatePoToken();
   const results = [];
 
-  // With cookies + PO tokens (from bgutil plugin)
-  const clients = ["web", "mweb", "android", "tv", "android_vr"];
-  
-  if (cookieFile) {
-    for (const client of clients) {
-      const args = ["-x", "--audio-format", "mp3", "--audio-quality", "5",
-        "-o", outputFile, "--no-playlist", "--no-warnings", "--no-check-certificates",
-        "--extractor-args", `youtube:player_client=${client}`,
-        "--cookies", cookieFile];
-      if (ffmpegPath) args.push("--ffmpeg-location", ffmpegPath);
-      args.push(videoUrl);
+  // Build extractor-args with PO token
+  const poTokenArg = poToken ? `;po_token=gvs:${poToken}` : "";
 
-      const label = `${client}+cookies${potProviderReady ? "+pot" : ""}`;
-      console.log(`Trying ${label}...`);
-      const result = await runYtDlp(args);
-
-      if (result.ok && fs.existsSync(outputFile) && fs.statSync(outputFile).size > 1000) {
-        console.log(`✓ ${label} succeeded: ${fs.statSync(outputFile).size} bytes`);
-        return { ok: true, method: label, results };
-      }
-      const errorLine = result.stderr.split("\n").find(l => l.includes("ERROR")) || result.stderr.substring(0, 300);
-      results.push({ method: label, error: errorLine });
-      try { if (fs.existsSync(outputFile)) fs.unlinkSync(outputFile); } catch(e) {}
-    }
+  const attempts = [];
+  // With cookies + PO token (different clients)
+  if (cookieFile && poToken) {
+    attempts.push({ client: "web", cookies: true, pot: true });
+    attempts.push({ client: "mweb", cookies: true, pot: true });
+    attempts.push({ client: "android", cookies: true, pot: true });
   }
+  // PO token only (no cookies)
+  if (poToken) {
+    attempts.push({ client: null, cookies: false, pot: true });
+    attempts.push({ client: "android_vr", cookies: false, pot: true });
+  }
+  // Cookies only (no PO token - fallback)
+  if (cookieFile) {
+    attempts.push({ client: "web", cookies: true, pot: false });
+  }
+  // Last resort: no cookies, no PO token
+  attempts.push({ client: "android_vr", cookies: false, pot: false });
 
-  // Without cookies
-  for (const client of ["android_vr"]) {
+  for (const a of attempts) {
+    let extractorArgs = "";
+    if (a.client) extractorArgs += `youtube:player_client=${a.client}`;
+    if (a.pot && poToken) extractorArgs += (a.client ? ";" : "youtube:") + `po_token=gvs:${poToken}`;
+    if (!a.client && !a.pot) extractorArgs = "";
+
     const args = ["-x", "--audio-format", "mp3", "--audio-quality", "5",
-      "-o", outputFile, "--no-playlist", "--no-warnings", "--no-check-certificates",
-      "--extractor-args", `youtube:player_client=${client}`];
+      "-o", outputFile, "--no-playlist", "--no-warnings", "--no-check-certificates"];
+    if (extractorArgs) args.push("--extractor-args", extractorArgs);
+    if (a.cookies && cookieFile) args.push("--cookies", cookieFile);
     if (ffmpegPath) args.push("--ffmpeg-location", ffmpegPath);
     args.push(videoUrl);
-    const label = `${client}${potProviderReady ? "+pot" : ""}`;
+
+    const label = `${a.client || "default"}${a.cookies ? "+cookies" : ""}${a.pot ? "+pot" : ""}`;
+    console.log(`Trying ${label}...`);
     const result = await runYtDlp(args);
-    if (result.ok && fs.existsSync(outputFile) && fs.statSync(outputFile).size > 1000) return { ok: true, method: label, results };
-    results.push({ method: label, error: result.stderr.split("\n").find(l => l.includes("ERROR")) || "failed" });
+
+    if (result.ok && fs.existsSync(outputFile) && fs.statSync(outputFile).size > 1000) {
+      console.log(`✓ ${label} succeeded: ${fs.statSync(outputFile).size} bytes`);
+      return { ok: true, method: label, results };
+    }
+    const errorLine = result.stderr.split("\n").find(l => l.includes("ERROR")) || result.stderr.substring(0, 300);
+    results.push({ method: label, error: errorLine });
+    console.log(`✗ ${label}: ${errorLine}`);
     try { if (fs.existsSync(outputFile)) fs.unlinkSync(outputFile); } catch(e) {}
   }
 
@@ -224,58 +232,28 @@ function tagMp3(inputFile, outputFile, metadata, artworkPath) {
 
 // ─── Routes ───
 app.get("/", (req, res) => { res.send("SideCut backend is online!"); });
-
-app.get("/health", (req, res) => {
-  res.json({ status: "ok", spotify: !!process.env.SPOTIFY_CLIENT_ID, cookies: !!getCookieFile(), pot_provider: potProviderReady });
-});
+app.get("/health", (req, res) => { res.json({ status: "ok", spotify: !!process.env.SPOTIFY_CLIENT_ID, cookies: !!getCookieFile() }); });
 
 app.get("/debug", async (req, res) => {
   let ytDlpVersion = null;
   try { ytDlpVersion = (await execFileAsync("yt-dlp", ["--version"], { timeout: 5000 })).stdout.trim(); } catch(e) {}
-  
-  // Check if bgutil pip plugin is installed
-  let bgutilPlugin = false;
-  try { const r = await execFileAsync("pip3", ["show", "bgutil-ytdlp-pot-provider"], { timeout: 5000 }); bgutilPlugin = r.stdout.includes("bgutil"); } catch(e) {}
-  
-  // Check if provider server is built
-  const home = process.env.HOME || "/root";
-  const providerServer = path.join(home, "bgutil-ytdlp-pot-provider", "server", "build", "main.js");
-  const providerBuilt = fs.existsSync(providerServer);
-  
-  // Check yt-dlp verbose output for PO Token providers
-  let potProviders = null;
-  try {
-    const r = await runYtDlp(["--list-extractors", "--print", "%P"], 5000);
-    potProviders = r.stdout.substring(0, 500);
-  } catch(e) {}
-
   res.json({
-    youtube_dl_exec: !!youtubedl, ffmpeg: !!ffmpeg, ffmpeg_path: ffmpegPath,
-    spotify: !!process.env.SPOTIFY_CLIENT_ID, cookies: getCookieFile() ? "configured" : "not configured",
-    yt_dlp_version: ytDlpVersion,
-    pot_provider_running: potProviderReady,
-    bgutil_plugin_installed: bgutilPlugin,
-    bgutil_provider_built: providerBuilt,
-    provider_path: providerServer,
-    chrome_path: findChromePath(),
-    node_version: process.version, platform: process.platform, home: home,
+    youtube_dl_exec: !!youtubedl, ffmpeg: !!ffmpeg, spotify: !!process.env.SPOTIFY_CLIENT_ID,
+    cookies: getCookieFile() ? "configured" : "not configured",
+    yt_dlp_version: ytDlpVersion, has_po_token: !!cachedPoToken,
+    node_version: process.version,
   });
 });
 
-app.get("/test-download", async (req, res) => {
-  if (!potProviderReady) await startPotProvider();
-  const { ok, method, results } = await tryDownload("https://www.youtube.com/watch?v=4NRXx6U8ABQ", "/tmp/sidecut_test.mp3");
-  try { if (fs.existsSync("/tmp/sidecut_test.mp3")) fs.unlinkSync("/tmp/sidecut_test.mp3"); } catch(e) {}
-  res.json({ success: ok, winningMethod: method, results, potProvider: potProviderReady });
+app.get("/test-pot", async (req, res) => {
+  const token = await generatePoToken();
+  res.json({ success: !!token, token: token ? token.substring(0, 40) + "..." : null });
 });
 
-app.get("/diag", async (req, res) => {
-  const cookieFile = getCookieFile();
-  const args = ["--list-formats", "--no-playlist", "--no-warnings", "--extractor-args", "youtube:player_client=web"];
-  if (cookieFile) args.push("--cookies", cookieFile);
-  args.push("https://www.youtube.com/watch?v=4NRXx6U8ABQ");
-  const result = await runYtDlp(args, 60000);
-  res.json({ pot_provider: potProviderReady, cookies: !!cookieFile, format_list: (result.stderr + "\n" + result.stdout).trim().substring(0, 5000) });
+app.get("/test-download", async (req, res) => {
+  const { ok, method, results } = await tryDownload("https://www.youtube.com/watch?v=4NRXx6U8ABQ", "/tmp/sidecut_test.mp3");
+  try { if (fs.existsSync("/tmp/sidecut_test.mp3")) fs.unlinkSync("/tmp/sidecut_test.mp3"); } catch(e) {}
+  res.json({ success: ok, winningMethod: method, results });
 });
 
 app.post("/metadata", async (req, res) => {
@@ -312,8 +290,6 @@ app.post("/download", async (req, res) => {
     const type = match[1], id = match[2];
     if (type !== "track") return res.status(400).json({ success: false, error: "Only individual tracks supported." });
 
-    if (!potProviderReady) await startPotProvider();
-
     await ensureSpotifyToken();
     const track = (await spotifyApi.getTrack(id)).body;
     const artistName = track.artists.map((a) => a.name).join(", ");
@@ -335,7 +311,6 @@ app.post("/download", async (req, res) => {
       return res.status(502).json({
         success: false,
         error: (results || []).map(r => `[${r.method}]: ${r.error}`).join(" | "),
-        potProvider: potProviderReady,
         video: { title: video.title, url: video.url },
       });
     }
@@ -361,7 +336,4 @@ app.post("/download", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, async () => {
-  console.log(`SideCut backend running on port ${PORT}`);
-  await startPotProvider();
-});
+app.listen(PORT, () => console.log(`SideCut backend running on port ${PORT}`));
