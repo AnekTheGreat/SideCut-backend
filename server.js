@@ -10,7 +10,7 @@ const crypto = require("crypto");
 const SpotifyWebApi = require("spotify-web-api-node");
 const ytSearch = require("yt-search");
 const { safeUnlink, isValidDownload, downloadFile } = require("./lib/fileUtils");
-const { parseSpotifyUrl, joinArtists, firstImageUrl } = require("./lib/spotifyUtils");
+const { parseSpotifyUrl, joinArtists, firstImageUrl, buildSearchQuery, mapTrackToMetadata } = require("./lib/spotifyUtils");
 const { runYtDlp, buildYtDlpArgs, extractErrorLine } = require("./lib/ytdlp");
 const { normalizeCookies, analyzeCookieFile } = require("./lib/cookieUtils");
 
@@ -498,6 +498,48 @@ app.post("/metadata", requireApiKey, async (req, res) => {
     }
   } catch (error) {
     console.error("[/metadata] error:", error.message);
+    res.status(500).json({ success: false, error: "Failed: " + error.message });
+  }
+});
+
+// Look up the best-matching Spotify track metadata for a song that lacks it.
+// `spec` is { query } or { title, artist }. Resolves to the mapped metadata,
+// or a { found: false } result when nothing matches or the input is empty.
+async function lookupMetadata(spec) {
+  const q = buildSearchQuery(spec || {});
+  if (!q) return { query: null, found: false, error: "No search terms provided", ...spec };
+  const r = await spotifyApi.searchTracks(q, { limit: 1 });
+  const track = r.body.tracks?.items?.[0];
+  if (!track) return { query: q, found: false };
+  return { query: q, found: true, ...mapTrackToMetadata(track) };
+}
+
+// Enrich songs missing metadata by searching Spotify. Accepts a single song
+// ({ query } or { title, artist }) or a batch ({ items: [...] }, max 50) and
+// returns the best-matching title/artist/album/artwork for each.
+app.post("/search-metadata", requireApiKey, async (req, res) => {
+  const { items, query, title, artist } = req.body || {};
+  // Validate inputs before touching Spotify so bad requests fail fast.
+  if (Array.isArray(items)) {
+    if (items.length > 50)
+      return res.status(400).json({ success: false, error: "Too many items (max 50)" });
+  } else if (!buildSearchQuery({ query, title, artist })) {
+    return res.status(400).json({ success: false, error: "Provide query, title, or items[]" });
+  }
+  try {
+    await ensureSpotifyToken();
+    if (Array.isArray(items)) {
+      const results = await Promise.all(
+        items.map((it) =>
+          lookupMetadata(it).catch((e) => ({ query: buildSearchQuery(it || {}), found: false, error: e.message }))
+        )
+      );
+      return res.json({ success: true, count: results.length, results });
+    }
+    const result = await lookupMetadata({ query, title, artist });
+    return res.json({ success: true, ...result });
+  } catch (error) {
+    console.error("[/search-metadata] error:", error.message);
     res.status(500).json({ success: false, error: "Failed: " + error.message });
   }
 });
