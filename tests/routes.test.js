@@ -54,6 +54,29 @@ describe("POST /metadata", () => {
   });
 });
 
+describe("POST /search-metadata", () => {
+  test("400 when no query/title/items provided", async () => {
+    const res = await request(app).post("/search-metadata").send({});
+    expect(res.status).toBe(400);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/Provide query, title, or items/);
+  });
+
+  test("400 when batch exceeds the item limit", async () => {
+    const items = Array.from({ length: 51 }, (_, i) => ({ query: `song ${i}` }));
+    const res = await request(app).post("/search-metadata").send({ items });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/Too many items/);
+  });
+
+  test("500 when Spotify credentials are not configured", async () => {
+    const res = await request(app).post("/search-metadata").send({ query: "daft punk" });
+    expect(res.status).toBe(500);
+    expect(res.body.success).toBe(false);
+    expect(res.body.error).toMatch(/Spotify credentials not configured/);
+  });
+});
+
 describe("POST /download", () => {
   test("400 when no URL is provided", async () => {
     const res = await request(app).post("/download").send({});
