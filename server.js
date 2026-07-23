@@ -6,6 +6,7 @@ const fs = require("fs");
 const { execFile } = require("child_process");
 const { promisify } = require("util");
 const execFileAsync = promisify(execFile);
+const crypto = require("crypto");
 const SpotifyWebApi = require("spotify-web-api-node");
 const ytSearch = require("yt-search");
 
@@ -218,8 +219,55 @@ function startPotProviderServer() {
 }
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+
+// ─── Security configuration ───
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const API_KEY = process.env.API_KEY || "";
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
+
+// Constant-time string comparison to avoid timing attacks on secret checks
+function safeEqual(a, b) {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+// Require a valid API key for public data endpoints when API_KEY is configured.
+// If API_KEY is unset the endpoints stay open (backward compatible) but a
+// warning is logged at startup so the operator is aware.
+function requireApiKey(req, res, next) {
+  if (!API_KEY) return next();
+  const provided =
+    req.get("x-api-key") ||
+    (req.get("authorization") || "").replace(/^Bearer\s+/i, "");
+  if (safeEqual(provided, API_KEY)) return next();
+  return res.status(401).json({ success: false, error: "Unauthorized" });
+}
+
+// Diagnostic endpoints are disabled unless ADMIN_TOKEN is set, and then require
+// it. A 404 is returned otherwise so their existence is not advertised.
+function requireAdmin(req, res, next) {
+  if (!ADMIN_TOKEN) return res.status(404).send("Not found");
+  const provided = req.get("x-admin-token") || req.query.token || "";
+  if (safeEqual(String(provided), ADMIN_TOKEN)) return next();
+  return res.status(404).send("Not found");
+}
+
+if (ALLOWED_ORIGINS.length > 0) {
+  app.use(cors({ origin: ALLOWED_ORIGINS }));
+} else {
+  console.warn(
+    "[SECURITY] ALLOWED_ORIGINS not set \u2014 CORS is open to all origins. " +
+      "Set ALLOWED_ORIGINS (comma-separated) to restrict access."
+  );
+  app.use(cors());
+}
+app.use(express.json({ limit: "16kb" }));
 
 // â”€â”€â”€ Spotify API â”€â”€â”€
 const spotifyApi = new SpotifyWebApi({
@@ -384,7 +432,7 @@ app.get("/health", (req, res) => {
   });
 });
 
-app.get("/debug", async (req, res) => {
+app.get("/debug", requireAdmin, async (req, res) => {
   let ytDlpVersion = null;
   try { ytDlpVersion = (await execFileAsync("yt-dlp", ["--version"], { timeout: 5000 })).stdout.trim(); } catch (e) {}
 
@@ -427,7 +475,7 @@ app.get("/debug", async (req, res) => {
   });
 });
 
-app.get("/test-pot", async (req, res) => {
+app.get("/test-pot", requireAdmin, async (req, res) => {
   console.log("=== /test-pot endpoint hit ===");
   const token = await generatePoToken();
   res.json({
@@ -438,7 +486,7 @@ app.get("/test-pot", async (req, res) => {
   });
 });
 
-app.get("/test-download", async (req, res) => {
+app.get("/test-download", requireAdmin, async (req, res) => {
   console.log("=== /test-download endpoint hit ===");
   const { ok, method, results } = await tryDownload(
     "https://www.youtube.com/watch?v=4NRXx6U8ABQ",
@@ -448,7 +496,7 @@ app.get("/test-download", async (req, res) => {
   res.json({ success: ok, winningMethod: method, results, hasPoToken: !!cachedPoToken });
 });
 
-app.post("/metadata", async (req, res) => {
+app.post("/metadata", requireApiKey, async (req, res) => {
   const { url } = req.body;
   if (!url) return res.status(400).json({ success: false, error: "No URL provided" });
   try {
@@ -469,11 +517,12 @@ app.post("/metadata", async (req, res) => {
       res.json({ success: true, type, id, title: d.name, artist: d.owner?.display_name || "Various Artists", album: d.name, artwork: d.images[0]?.url || "", trackCount: tracks.length, tracks, url });
     }
   } catch (error) {
-    res.status(500).json({ success: false, error: "Failed: " + error.message });
+    console.error("[/metadata] error:", error.message);
+    res.status(500).json({ success: false, error: "Failed to fetch metadata" });
   }
 });
 
-app.post("/download", async (req, res) => {
+app.post("/download", requireApiKey, async (req, res) => {
   const { url } = req.body;
   if (!url) return res.status(400).json({ success: false, error: "No URL provided" });
   let artworkPath = null, rawFile = null, taggedFile = null;
@@ -529,8 +578,9 @@ app.post("/download", async (req, res) => {
     });
     req.on("close", () => cleanup());
   } catch (error) {
+    console.error("[/download] error:", error.message);
     cleanup();
-    if (!res.headersSent) res.status(500).json({ success: false, error: "Download failed: " + error.message });
+    if (!res.headersSent) res.status(500).json({ success: false, error: "Download failed" });
   }
   function cleanup() {
     [artworkPath, ...tempFiles].forEach((f) => {
@@ -542,8 +592,18 @@ app.post("/download", async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
   console.log(`SideCut backend running on port ${PORT}`);
-  console.log(`HOME: ${process.env.HOME}`);
   console.log(`Node: ${process.version}`);
+  if (!API_KEY) {
+    console.warn(
+      "[SECURITY] API_KEY not set \u2014 /metadata and /download are unauthenticated. " +
+        "Set API_KEY to require an x-api-key header."
+    );
+  }
+  if (!ADMIN_TOKEN) {
+    console.warn(
+      "[SECURITY] ADMIN_TOKEN not set \u2014 /debug, /test-pot and /test-download are disabled."
+    );
+  }
 
   // Start the PO Token provider server (for pip plugin auto-connect)
   startPotProviderServer();
