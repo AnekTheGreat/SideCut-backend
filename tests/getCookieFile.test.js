@@ -53,7 +53,8 @@ describe("getCookieFile", () => {
     const { getCookieFile } = require("../server");
     const result = getCookieFile();
     expect(result).toBe("/tmp/yt_cookies.txt");
-    expect(fs.readFileSync(result, "utf8")).toBe("cookie-data-here");
+    // Contents are normalized (Netscape header prepended) but preserve the data.
+    expect(fs.readFileSync(result, "utf8")).toContain("cookie-data-here");
   });
 
   test("caches the resolved path across calls", () => {

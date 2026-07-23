@@ -12,3 +12,5 @@ services:
         sync: false
       - key: YOUTUBE_COOKIES
         sync: false
+      - key: YOUTUBE_PROXY
+        sync: false

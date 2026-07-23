@@ -11,6 +11,7 @@ const ytSearch = require("yt-search");
 const { safeUnlink, isValidDownload, downloadFile } = require("./lib/fileUtils");
 const { parseSpotifyUrl, joinArtists, firstImageUrl } = require("./lib/spotifyUtils");
 const { runYtDlp, buildYtDlpArgs, extractErrorLine } = require("./lib/ytdlp");
+const { normalizeCookies, analyzeCookieFile } = require("./lib/cookieUtils");
 
 let ffmpeg = null, ffmpegPath = null;
 try {
@@ -257,7 +258,7 @@ function getCookieFile() {
   }
   if (process.env.YOUTUBE_COOKIES) {
     cookieFilePath = "/tmp/yt_cookies.txt";
-    fs.writeFileSync(cookieFilePath, process.env.YOUTUBE_COOKIES);
+    fs.writeFileSync(cookieFilePath, normalizeCookies(process.env.YOUTUBE_COOKIES));
     return cookieFilePath;
   }
   return null;
@@ -390,6 +391,8 @@ app.get("/debug", async (req, res) => {
     ffmpeg: !!ffmpeg,
     spotify: !!process.env.SPOTIFY_CLIENT_ID,
     cookies: getCookieFile() ? "configured" : "not configured",
+    cookie_status: analyzeCookieFile(getCookieFile()),
+    proxy_configured: !!process.env.YOUTUBE_PROXY,
     yt_dlp_version: ytDlpVersion,
     yt_dlp_path: ytDlpPath,
     has_po_token: !!cachedPoToken,
@@ -546,6 +549,8 @@ module.exports = {
   start,
   parseSpotifyUrl,
   getCookieFile,
+  normalizeCookies,
+  analyzeCookieFile,
   downloadFile,
   tagMp3,
   fetchFn,
