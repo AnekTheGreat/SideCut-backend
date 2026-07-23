@@ -3,6 +3,7 @@ const cors = require("cors");
 const https = require("https");
 const http = require("http");
 const fs = require("fs");
+const path = require("path");
 const { execFile, spawn } = require("child_process");
 const { promisify } = require("util");
 const execFileAsync = promisify(execFile);
@@ -17,17 +18,6 @@ try {
   ffmpegPath = require("ffmpeg-static");
   ffmpeg.setFfmpegPath(ffmpegPath);
 } catch (e) {}
-
-// Find Puppeteer's Chrome binary
-let puppeteer = null;
-let chromePath = null;
-try {
-  puppeteer = require("puppeteer");
-  chromePath = puppeteer.executablePath();
-  console.log(`✓ Puppeteer Chrome found: ${chromePath}`);
-} catch (e) {
-  console.log("⚠ Puppeteer not available:", e.message);
-}
 
 const app = express();
 app.use(cors());
@@ -72,21 +62,37 @@ function getCookieFile() {
   return null;
 }
 
-// ─── PO Token Provider (bgutil-ytdlp-pot-provider) ───
-let potProviderReady = false;
-let potProviderProcess = null;
-
+// ─── Find Chrome for the PO Token provider ───
 function findChromePath() {
-  // Check env var first
+  // Check env var
   if (process.env.CHROME_PATH && fs.existsSync(process.env.CHROME_PATH)) return process.env.CHROME_PATH;
-  // Use Puppeteer's Chrome
-  if (chromePath && fs.existsSync(chromePath)) return chromePath;
-  // Check standard locations
+  // Puppeteer's Chrome
+  try {
+    const puppeteer = require("puppeteer");
+    const p = puppeteer.executablePath();
+    if (p && fs.existsSync(p)) return p;
+  } catch (e) {}
+  // Puppeteer cache
+  const home = process.env.HOME || "/root";
+  const cacheDir = path.join(home, ".cache", "puppeteer", "chrome");
+  try {
+    if (fs.existsSync(cacheDir)) {
+      const versions = fs.readdirSync(cacheDir);
+      for (const v of versions) {
+        const chromePath = path.join(cacheDir, v, "chrome-linux64", "chrome");
+        if (fs.existsSync(chromePath)) return chromePath;
+      }
+    }
+  } catch (e) {}
+  // System
   for (const p of ["/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome"]) {
     if (fs.existsSync(p)) return p;
   }
   return null;
 }
+
+// ─── PO Token Provider (bgutil HTTP server) ───
+let potProviderReady = false;
 
 async function checkPotProvider() {
   return new Promise((resolve) => {
@@ -106,23 +112,32 @@ async function startPotProvider() {
     return true;
   }
 
-  const foundChrome = findChromePath();
-  console.log(`Starting PO Token provider... Chrome: ${foundChrome || "not found"}`);
+  // Find the provider server
+  const home = process.env.HOME || "/root";
+  const providerDir = path.join(home, "bgutil-ytdlp-pot-provider", "server");
+  const serverJs = path.join(providerDir, "build", "main.js");
+  
+  if (!fs.existsSync(serverJs)) {
+    console.log("⚠ bgutil provider not found at", serverJs);
+    return false;
+  }
 
+  const chrome = findChromePath();
+  console.log(`Starting PO Token provider... Chrome: ${chrome || "not found"}`);
+  
   const env = { ...process.env };
-  if (foundChrome) env.CHROME_PATH = foundChrome;
+  if (chrome) env.CHROME_PATH = chrome;
 
   try {
-    potProviderProcess = spawn("python", ["-m", "bgutil_ytdlp_pot_provider"], {
-      env, stdio: ["ignore", "pipe", "pipe"], detached: false,
+    const provider = spawn("node", [serverJs], {
+      env, stdio: ["ignore", "pipe", "pipe"], detached: false, cwd: providerDir,
     });
+    provider.stdout.on("data", (d) => console.log(`  [POT] ${d.toString().trim()}`));
+    provider.stderr.on("data", (d) => console.log(`  [POT] ${d.toString().trim()}`));
+    provider.on("error", (e) => console.log(`  [POT] Start failed: ${e.message}`));
+    provider.on("exit", (code) => console.log(`  [POT] Exited: ${code}`));
 
-    potProviderProcess.stdout.on("data", (d) => console.log(`  [POT] ${d.toString().trim()}`));
-    potProviderProcess.stderr.on("data", (d) => console.log(`  [POT] ${d.toString().trim()}`));
-    potProviderProcess.on("error", (e) => console.log(`  [POT] Start failed: ${e.message}`));
-    potProviderProcess.on("exit", (code) => console.log(`  [POT] Exited: ${code}`));
-
-    for (let i = 0; i < 15; i++) {
+    for (let i = 0; i < 20; i++) {
       await new Promise(r => setTimeout(r, 2000));
       if (await checkPotProvider()) {
         console.log("✓ PO Token provider ready");
@@ -152,6 +167,7 @@ async function tryDownload(videoUrl, outputFile) {
   const cookieFile = getCookieFile();
   const results = [];
 
+  // With cookies + PO tokens (from bgutil plugin)
   const clients = ["web", "mweb", "android", "tv", "android_vr"];
   
   if (cookieFile) {
@@ -171,27 +187,22 @@ async function tryDownload(videoUrl, outputFile) {
         console.log(`✓ ${label} succeeded: ${fs.statSync(outputFile).size} bytes`);
         return { ok: true, method: label, results };
       }
-
       const errorLine = result.stderr.split("\n").find(l => l.includes("ERROR")) || result.stderr.substring(0, 300);
       results.push({ method: label, error: errorLine });
-      console.log(`✗ ${label}: ${errorLine}`);
       try { if (fs.existsSync(outputFile)) fs.unlinkSync(outputFile); } catch(e) {}
     }
   }
 
-  // Without cookies as last resort
+  // Without cookies
   for (const client of ["android_vr"]) {
     const args = ["-x", "--audio-format", "mp3", "--audio-quality", "5",
       "-o", outputFile, "--no-playlist", "--no-warnings", "--no-check-certificates",
       "--extractor-args", `youtube:player_client=${client}`];
     if (ffmpegPath) args.push("--ffmpeg-location", ffmpegPath);
     args.push(videoUrl);
-
     const label = `${client}${potProviderReady ? "+pot" : ""}`;
     const result = await runYtDlp(args);
-    if (result.ok && fs.existsSync(outputFile) && fs.statSync(outputFile).size > 1000) {
-      return { ok: true, method: label, results };
-    }
+    if (result.ok && fs.existsSync(outputFile) && fs.statSync(outputFile).size > 1000) return { ok: true, method: label, results };
     results.push({ method: label, error: result.stderr.split("\n").find(l => l.includes("ERROR")) || "failed" });
     try { if (fs.existsSync(outputFile)) fs.unlinkSync(outputFile); } catch(e) {}
   }
@@ -221,18 +232,33 @@ app.get("/health", (req, res) => {
 app.get("/debug", async (req, res) => {
   let ytDlpVersion = null;
   try { ytDlpVersion = (await execFileAsync("yt-dlp", ["--version"], { timeout: 5000 })).stdout.trim(); } catch(e) {}
-  let bgutilInstalled = false;
-  try { await execFileAsync("python", ["-c", "import bgutil_ytdlp_pot_provider"], { timeout: 5000 }); bgutilInstalled = true; } catch(e) {}
   
+  // Check if bgutil pip plugin is installed
+  let bgutilPlugin = false;
+  try { const r = await execFileAsync("pip3", ["show", "bgutil-ytdlp-pot-provider"], { timeout: 5000 }); bgutilPlugin = r.stdout.includes("bgutil"); } catch(e) {}
+  
+  // Check if provider server is built
+  const home = process.env.HOME || "/root";
+  const providerServer = path.join(home, "bgutil-ytdlp-pot-provider", "server", "build", "main.js");
+  const providerBuilt = fs.existsSync(providerServer);
+  
+  // Check yt-dlp verbose output for PO Token providers
+  let potProviders = null;
+  try {
+    const r = await runYtDlp(["--list-extractors", "--print", "%P"], 5000);
+    potProviders = r.stdout.substring(0, 500);
+  } catch(e) {}
+
   res.json({
     youtube_dl_exec: !!youtubedl, ffmpeg: !!ffmpeg, ffmpeg_path: ffmpegPath,
     spotify: !!process.env.SPOTIFY_CLIENT_ID, cookies: getCookieFile() ? "configured" : "not configured",
     yt_dlp_version: ytDlpVersion,
     pot_provider_running: potProviderReady,
-    bgutil_installed: bgutilInstalled,
+    bgutil_plugin_installed: bgutilPlugin,
+    bgutil_provider_built: providerBuilt,
+    provider_path: providerServer,
     chrome_path: findChromePath(),
-    puppeteer_available: !!puppeteer,
-    node_version: process.version, platform: process.platform,
+    node_version: process.version, platform: process.platform, home: home,
   });
 });
 
@@ -249,10 +275,7 @@ app.get("/diag", async (req, res) => {
   if (cookieFile) args.push("--cookies", cookieFile);
   args.push("https://www.youtube.com/watch?v=4NRXx6U8ABQ");
   const result = await runYtDlp(args, 60000);
-  res.json({
-    pot_provider: potProviderReady, cookies: !!cookieFile,
-    format_list: (result.stderr + "\n" + result.stdout).trim().substring(0, 5000),
-  });
+  res.json({ pot_provider: potProviderReady, cookies: !!cookieFile, format_list: (result.stderr + "\n" + result.stdout).trim().substring(0, 5000) });
 });
 
 app.post("/metadata", async (req, res) => {
