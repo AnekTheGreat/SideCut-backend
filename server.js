@@ -1,8 +1,9 @@
 const express = require("express");
 const cors = require("cors");
 const https = require("https");
+const http = require("http");
 const fs = require("fs");
-const { execFile } = require("child_process");
+const { execFile, spawn } = require("child_process");
 const { promisify } = require("util");
 const execFileAsync = promisify(execFile);
 const SpotifyWebApi = require("spotify-web-api-node");
@@ -21,6 +22,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+// ─── Spotify API ───
 const spotifyApi = new SpotifyWebApi({
   clientId: process.env.SPOTIFY_CLIENT_ID || "",
   clientSecret: process.env.SPOTIFY_CLIENT_SECRET || "",
@@ -44,6 +46,7 @@ function downloadFile(url, dest) {
   });
 }
 
+// ─── Cookies ───
 let cookieFilePath = null;
 function getCookieFile() {
   if (cookieFilePath && fs.existsSync(cookieFilePath)) return cookieFilePath;
@@ -58,119 +61,138 @@ function getCookieFile() {
   return null;
 }
 
-// Run yt-dlp and capture FULL output (no truncation)
-async function runYtDlpRaw(args, timeout = 120000) {
+// ─── Start bgutil-ytdlp-pot-provider (PO Token generator) ───
+let potProviderReady = false;
+let potProviderProcess = null;
+
+async function checkPotProvider() {
+  return new Promise((resolve) => {
+    const req = http.get("http://127.0.0.1:4416/ping", (res) => {
+      let data = "";
+      res.on("data", (c) => data += c);
+      res.on("end", () => resolve(res.statusCode === 200));
+    });
+    req.on("error", () => resolve(false));
+    req.setTimeout(3000, () => { req.destroy(); resolve(false); });
+  });
+}
+
+async function startPotProvider() {
+  // Check if already running
+  if (await checkPotProvider()) {
+    console.log("✓ PO Token provider already running");
+    potProviderReady = true;
+    return true;
+  }
+
+  console.log("Starting PO Token provider (bgutil-ytdlp-pot-provider)...");
+  
+  // Find chromium binary
+  let chromePath = process.env.CHROME_PATH || "";
+  if (!chromePath) {
+    for (const p of ["/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome"]) {
+      if (fs.existsSync(p)) { chromePath = p; break; }
+    }
+  }
+
+  const env = { ...process.env };
+  if (chromePath) {
+    env.CHROME_PATH = chromePath;
+    console.log(`  Chromium: ${chromePath}`);
+  }
+
+  // Start the provider
+  try {
+    potProviderProcess = spawn("python", ["-m", "bgutil_ytdlp_pot_provider"], {
+      env,
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: false,
+    });
+
+    potProviderProcess.stdout.on("data", (d) => console.log(`  [POT] ${d.toString().trim()}`));
+    potProviderProcess.stderr.on("data", (d) => console.log(`  [POT] ${d.toString().trim()}`));
+    potProviderProcess.on("error", (e) => console.log(`  [POT] Failed to start: ${e.message}`));
+    potProviderProcess.on("exit", (code) => console.log(`  [POT] Exited with code ${code}`));
+
+    // Wait for it to be ready (up to 30 seconds)
+    for (let i = 0; i < 15; i++) {
+      await new Promise(r => setTimeout(r, 2000));
+      if (await checkPotProvider()) {
+        console.log("✓ PO Token provider is ready");
+        potProviderReady = true;
+        return true;
+      }
+    }
+    console.log("⚠ PO Token provider didn't start in time");
+    return false;
+  } catch (e) {
+    console.log("⚠ Could not start PO Token provider:", e.message);
+    return false;
+  }
+}
+
+// ─── Run yt-dlp ───
+async function runYtDlp(args, timeout = 120000) {
   return new Promise((resolve) => {
     execFile("yt-dlp", args, { timeout, maxBuffer: 1024 * 1024 * 50, cwd: "/tmp" }, (err, stdout, stderr) => {
-      resolve({
-        ok: !err,
-        stdout: stdout || "",
-        stderr: stderr || (err ? err.message : ""),
-      });
+      resolve({ ok: !err, stdout: stdout || "", stderr: stderr || (err ? err.message : "") });
     });
   });
 }
 
-// ─── DIAGNOSTIC: list formats with every client+cookie combo ───
-app.get("/diag", async (req, res) => {
-  const videoUrl = "https://www.youtube.com/watch?v=4NRXx6U8ABQ";
+// ─── Download audio ───
+async function tryDownload(videoUrl, outputFile) {
   const cookieFile = getCookieFile();
-  const output = { cookies: cookieFile ? "yes" : "no", results: {} };
+  const results = [];
 
-  const combos = [];
-  // With cookies
+  // Strategy: try different clients with cookies + PO tokens (from bgutil)
+  // The bgutil plugin automatically provides PO tokens to yt-dlp
+  const clients = ["web", "mweb", "android", "tv", "ios", "android_vr"];
+  
   if (cookieFile) {
-    combos.push(["android_vr", true]);
-    combos.push(["android", true]);
-    combos.push(["tv", true]);
-    combos.push(["web", true]);
-    combos.push(["default", true]); // no extractor-args, let yt-dlp pick
-  }
-  // Without cookies
-  combos.push(["android_vr", false]);
-  combos.push(["default", false]);
+    for (const client of clients) {
+      const args = ["-x", "--audio-format", "mp3", "--audio-quality", "5",
+        "-o", outputFile, "--no-playlist", "--no-warnings", "--no-check-certificates",
+        "--extractor-args", `youtube:player_client=${client}`,
+        "--cookies", cookieFile];
+      if (ffmpegPath) args.push("--ffmpeg-location", ffmpegPath);
+      args.push(videoUrl);
 
-  for (const [client, useCookies] of combos) {
-    const key = `${client}${useCookies ? "+cookies" : ""}`;
-    const args = ["--list-formats", "--no-playlist", "--no-warnings"];
-    if (client !== "default") args.push("--extractor-args", `youtube:player_client=${client}`);
-    if (useCookies && cookieFile) args.push("--cookies", cookieFile);
-    args.push(videoUrl);
+      const label = `${client}+cookies${potProviderReady ? "+pot" : ""}`;
+      console.log(`Trying ${label}...`);
+      const result = await runYtDlp(args);
 
-    const result = await runYtDlpRaw(args, 60000);
-    output.results[key] = {
-      ok: result.ok,
-      // Show full stderr (contains the format list or error)
-      output: (result.stderr + "\n" + result.stdout).trim().substring(0, 3000),
-    };
-  }
+      if (result.ok && fs.existsSync(outputFile) && fs.statSync(outputFile).size > 1000) {
+        console.log(`✓ ${label} succeeded: ${fs.statSync(outputFile).size} bytes`);
+        return { ok: true, method: label, results };
+      }
 
-  // Also dump JSON for android_vr+cookies to see format details
-  if (cookieFile) {
-    const args = ["--dump-json", "--no-playlist", "--no-warnings", "--extractor-args", "youtube:player_client=android_vr", "--cookies", cookieFile, videoUrl];
-    const result = await runYtDlpRaw(args, 60000);
-    if (result.ok) {
-      try {
-        const json = JSON.parse(result.stdout);
-        output.json_dump = {
-          title: json.title,
-          format_count: (json.formats || []).length,
-          formats: (json.formats || []).slice(0, 10).map(f => ({
-            id: f.format_id, ext: f.ext, acodec: f.acodec, vcodec: f.vcodec,
-            abr: f.abr, tbr: f.tbr, protocol: f.protocol,
-            has_url: !!f.url, drm: f.drm || "none",
-          })),
-        };
-      } catch (e) { output.json_dump = { error: e.message, raw: result.stdout.substring(0, 500) }; }
-    } else {
-      output.json_dump = { error: result.stderr.substring(0, 1000) };
+      const errorLine = result.stderr.split("\n").find(l => l.includes("ERROR")) || result.stderr.substring(0, 300);
+      results.push({ method: label, error: errorLine });
+      console.log(`✗ ${label}: ${errorLine}`);
+      try { if (fs.existsSync(outputFile)) fs.unlinkSync(outputFile); } catch(e) {}
     }
   }
 
-  res.json(output);
-});
-
-// ─── Download: try android_vr+cookies first (no PO token needed) ───
-async function tryDownload(videoUrl, outputFile) {
-  const cookieFile = getCookieFile();
-  const strategies = [];
-
-  // NEW: android_vr + cookies — this client doesn't need PO token AND cookies might bypass bot detection
-  if (cookieFile) {
-    strategies.push({ client: "android_vr", cookies: true, label: "android_vr+cookies" });
-  }
-  // android_vr without cookies (works for some videos)
-  strategies.push({ client: "android_vr", cookies: false, label: "android_vr" });
-
-  // Other clients as fallback
-  if (cookieFile) {
-    strategies.push({ client: "android", cookies: true, label: "android+cookies" });
-    strategies.push({ client: "tv", cookies: true, label: "tv+cookies" });
-  }
-  // Default (let yt-dlp pick) with and without cookies
-  if (cookieFile) strategies.push({ client: null, cookies: true, label: "default+cookies" });
-  strategies.push({ client: null, cookies: false, label: "default" });
-
-  const results = [];
-  for (const s of strategies) {
+  // Without cookies (unlikely to work, but try)
+  for (const client of ["android_vr", "android"]) {
     const args = ["-x", "--audio-format", "mp3", "--audio-quality", "5",
-      "-o", outputFile, "--no-playlist", "--no-warnings", "--no-check-certificates"];
-    if (s.client) args.push("--extractor-args", `youtube:player_client=${s.client}`);
-    if (s.cookies && cookieFile) args.push("--cookies", cookieFile);
+      "-o", outputFile, "--no-playlist", "--no-warnings", "--no-check-certificates",
+      "--extractor-args", `youtube:player_client=${client}`];
     if (ffmpegPath) args.push("--ffmpeg-location", ffmpegPath);
     args.push(videoUrl);
 
-    console.log(`Trying ${s.label}...`);
-    const result = await runYtDlpRaw(args);
+    const label = `${client}${potProviderReady ? "+pot" : ""}`;
+    console.log(`Trying ${label}...`);
+    const result = await runYtDlp(args);
 
     if (result.ok && fs.existsSync(outputFile) && fs.statSync(outputFile).size > 1000) {
-      console.log(`✓ ${s.label} succeeded: ${fs.statSync(outputFile).size} bytes`);
-      return { ok: true, method: s.label, results };
+      console.log(`✓ ${label} succeeded`);
+      return { ok: true, method: label, results };
     }
 
     const errorLine = result.stderr.split("\n").find(l => l.includes("ERROR")) || result.stderr.substring(0, 300);
-    results.push({ method: s.label, error: errorLine });
-    console.log(`✗ ${s.label}: ${errorLine}`);
+    results.push({ method: label, error: errorLine });
     try { if (fs.existsSync(outputFile)) fs.unlinkSync(outputFile); } catch(e) {}
   }
 
@@ -191,22 +213,67 @@ function tagMp3(inputFile, outputFile, metadata, artworkPath) {
 
 // ─── Routes ───
 app.get("/", (req, res) => { res.send("SideCut backend is online!"); });
-app.get("/health", (req, res) => { res.json({ status: "ok", spotify: !!process.env.SPOTIFY_CLIENT_ID, cookies: !!getCookieFile() }); });
+
+app.get("/health", (req, res) => {
+  res.json({ 
+    status: "ok", 
+    spotify: !!process.env.SPOTIFY_CLIENT_ID, 
+    cookies: !!getCookieFile(),
+    pot_provider: potProviderReady,
+  });
+});
 
 app.get("/debug", async (req, res) => {
   let ytDlpVersion = null;
   try { ytDlpVersion = (await execFileAsync("yt-dlp", ["--version"], { timeout: 5000 })).stdout.trim(); } catch(e) {}
+  
+  // Check if bgutil is installed
+  let bgutilInstalled = false;
+  try { await execFileAsync("python", ["-m", "bgutil_ytdlp_pot_provider", "--help"], { timeout: 5000 }); bgutilInstalled = true; } catch(e) {}
+  
+  // Check for chromium
+  let chromePath = null;
+  for (const p of ["/usr/bin/chromium", "/usr/bin/chromium-browser", "/usr/bin/google-chrome"]) {
+    if (fs.existsSync(p)) { chromePath = p; break; }
+  }
+
   res.json({
     youtube_dl_exec: !!youtubedl, ffmpeg: !!ffmpeg, ffmpeg_path: ffmpegPath,
     spotify: !!process.env.SPOTIFY_CLIENT_ID, cookies: getCookieFile() ? "configured" : "not configured",
     yt_dlp_version: ytDlpVersion,
+    pot_provider_running: potProviderReady,
+    bgutil_installed: bgutilInstalled,
+    chrome_path: chromePath,
+    node_version: process.version,
+    platform: process.platform,
   });
 });
 
 app.get("/test-download", async (req, res) => {
+  // Ensure POT provider is running
+  if (!potProviderReady) await startPotProvider();
+  
   const { ok, method, results } = await tryDownload("https://www.youtube.com/watch?v=4NRXx6U8ABQ", "/tmp/sidecut_test.mp3");
   try { if (fs.existsSync("/tmp/sidecut_test.mp3")) fs.unlinkSync("/tmp/sidecut_test.mp3"); } catch(e) {}
-  res.json({ success: ok, winningMethod: method, results });
+  res.json({ success: ok, winningMethod: method, results, potProvider: potProviderReady });
+});
+
+// ─── /diag ───
+app.get("/diag", async (req, res) => {
+  const videoUrl = "https://www.youtube.com/watch?v=4NRXx6U8ABQ";
+  const cookieFile = getCookieFile();
+  
+  // List formats with web client + cookies + PO tokens (from bgutil)
+  const args = ["--list-formats", "--no-playlist", "--no-warnings", "--extractor-args", "youtube:player_client=web"];
+  if (cookieFile) args.push("--cookies", cookieFile);
+  args.push(videoUrl);
+  
+  const result = await runYtDlp(args, 60000);
+  res.json({
+    pot_provider: potProviderReady,
+    cookies: !!cookieFile,
+    format_list: (result.stderr + "\n" + result.stdout).trim().substring(0, 5000),
+  });
 });
 
 app.post("/metadata", async (req, res) => {
@@ -243,6 +310,9 @@ app.post("/download", async (req, res) => {
     const type = match[1], id = match[2];
     if (type !== "track") return res.status(400).json({ success: false, error: "Only individual tracks supported." });
 
+    // Ensure POT provider is running
+    if (!potProviderReady) await startPotProvider();
+
     await ensureSpotifyToken();
     const track = (await spotifyApi.getTrack(id)).body;
     const artistName = track.artists.map((a) => a.name).join(", ");
@@ -264,6 +334,7 @@ app.post("/download", async (req, res) => {
       return res.status(502).json({
         success: false,
         error: (results || []).map(r => `[${r.method}]: ${r.error}`).join(" | "),
+        potProvider: potProviderReady,
         video: { title: video.title, url: video.url },
       });
     }
@@ -288,5 +359,10 @@ app.post("/download", async (req, res) => {
   function cleanup() { [artworkPath, ...tempFiles].forEach((f) => { try { if (f && fs.existsSync(f)) fs.unlinkSync(f); } catch (e) {} }); }
 });
 
+// ─── Start server + POT provider ───
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`SideCut backend running on port ${PORT}`));
+app.listen(PORT, async () => {
+  console.log(`SideCut backend running on port ${PORT}`);
+  // Start PO Token provider in the background
+  await startPotProvider();
+});
