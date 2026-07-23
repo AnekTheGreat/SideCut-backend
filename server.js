@@ -16,6 +16,15 @@ try {
   ffmpeg.setFfmpegPath(ffmpegPath);
 } catch (e) {}
 
+// Resolve a usable yt-dlp binary. Prefer the one bundled by youtube-dl-exec
+// (installed via npm, so it always exists on hosts like Render without any
+// extra build step); fall back to a system-wide "yt-dlp" on PATH.
+let ytDlpPath = "yt-dlp";
+try {
+  const bundled = require("youtube-dl-exec").constants?.YOUTUBE_DL_PATH;
+  if (bundled && fs.existsSync(bundled)) ytDlpPath = bundled;
+} catch (e) {}
+
 // â”€â”€â”€ PO Token Generator (bgutils-js + JSDOM, NO Chrome needed) â”€â”€â”€
 let bgUtils = null;
 let jsdomReady = false;
@@ -276,7 +285,7 @@ function parseSpotifyUrl(url) {
 
 async function runYtDlp(args, timeout = 120000) {
   return new Promise((resolve) => {
-    execFile("yt-dlp", args, { timeout, maxBuffer: 1024 * 1024 * 50, cwd: "/tmp" }, (err, stdout, stderr) => {
+    execFile(ytDlpPath, args, { timeout, maxBuffer: 1024 * 1024 * 50, cwd: "/tmp" }, (err, stdout, stderr) => {
       resolve({ ok: !err, stdout: stdout || "", stderr: stderr || (err ? err.message : "") });
     });
   });
@@ -393,7 +402,7 @@ app.get("/health", (req, res) => {
 
 app.get("/debug", async (req, res) => {
   let ytDlpVersion = null;
-  try { ytDlpVersion = (await execFileAsync("yt-dlp", ["--version"], { timeout: 5000 })).stdout.trim(); } catch (e) {}
+  try { ytDlpVersion = (await execFileAsync(ytDlpPath, ["--version"], { timeout: 5000 })).stdout.trim(); } catch (e) {}
 
   let pipPlugin = false;
   try {
@@ -422,6 +431,7 @@ app.get("/debug", async (req, res) => {
     spotify: !!process.env.SPOTIFY_CLIENT_ID,
     cookies: getCookieFile() ? "configured" : "not configured",
     yt_dlp_version: ytDlpVersion,
+    yt_dlp_path: ytDlpPath,
     has_po_token: !!cachedPoToken,
     pip_plugin_installed: pipPlugin,
     pot_provider_running: potProviderRunning,
