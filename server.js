@@ -8,6 +8,9 @@ const { promisify } = require("util");
 const execFileAsync = promisify(execFile);
 const SpotifyWebApi = require("spotify-web-api-node");
 const ytSearch = require("yt-search");
+const { safeUnlink, isValidDownload, downloadFile } = require("./lib/fileUtils");
+const { parseSpotifyUrl, joinArtists, firstImageUrl } = require("./lib/spotifyUtils");
+const { runYtDlp, buildYtDlpArgs, extractErrorLine } = require("./lib/ytdlp");
 
 let ffmpeg = null, ffmpegPath = null;
 try {
@@ -25,6 +28,15 @@ process.on("unhandledRejection", (reason) => {
 process.on("uncaughtException", (err) => {
   console.error("[FATAL] Uncaught exception:", err.stack || err.message);
 });
+
+// Resolve a usable yt-dlp binary. Prefer the one bundled by youtube-dl-exec
+// (installed via npm, so it always exists on hosts like Render without any
+// extra build step); fall back to a system-wide "yt-dlp" on PATH.
+let ytDlpPath = "yt-dlp";
+try {
+  const bundled = require("youtube-dl-exec").constants?.YOUTUBE_DL_PATH;
+  if (bundled && fs.existsSync(bundled)) ytDlpPath = bundled;
+} catch (e) {}
 
 // â”€â”€â”€ PO Token Generator (bgutils-js + JSDOM, NO Chrome needed) â”€â”€â”€
 let bgUtils = null;
@@ -111,7 +123,7 @@ async function generatePoToken(contentBinding) {
     console.log("[POT] Starting PO Token generation...");
     await setupJSDOM();
     const { botguard, webpo, utils } = await loadBgUtils();
-    const { Innertube } = require("youtubei.js");
+    const { Innertube } = await import("youtubei.js");
 
     // 1. Get visitor data (content binding)
     if (!contentBinding) {
@@ -264,35 +276,6 @@ async function ensureSpotifyToken() {
   tokenExpiry = Date.now() + (data.body.expires_in - 60) * 1000;
 }
 
-function downloadFile(url, dest, redirects = 0) {
-  return new Promise((resolve, reject) => {
-    const file = fs.createWriteStream(dest);
-    const fail = (err) => {
-      file.close();
-      fs.unlink(dest, () => {});
-      reject(err);
-    };
-    file.on("error", fail);
-    https.get(url, (res) => {
-      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        file.close();
-        fs.unlink(dest, () => {});
-        if (redirects >= 5) return reject(new Error(`Too many redirects downloading ${url}`));
-        res.resume();
-        downloadFile(res.headers.location, dest, redirects + 1).then(resolve).catch(reject);
-        return;
-      }
-      if (res.statusCode < 200 || res.statusCode >= 300) {
-        res.resume();
-        return fail(new Error(`Download failed for ${url}: HTTP ${res.statusCode}`));
-      }
-      res.on("error", fail);
-      res.pipe(file);
-      file.on("finish", () => { file.close(); resolve(dest); });
-    }).on("error", fail);
-  });
-}
-
 let cookieFilePath = null;
 function getCookieFile() {
   if (cookieFilePath && fs.existsSync(cookieFilePath)) return cookieFilePath;
@@ -308,14 +291,6 @@ function getCookieFile() {
   return null;
 }
 
-async function runYtDlp(args, timeout = 120000) {
-  return new Promise((resolve) => {
-    execFile("yt-dlp", args, { timeout, maxBuffer: 1024 * 1024 * 50, cwd: "/tmp" }, (err, stdout, stderr) => {
-      resolve({ ok: !err, stdout: stdout || "", stderr: stderr || (err ? err.message : "") });
-    });
-  });
-}
-
 async function tryDownload(videoUrl, outputFile) {
   const cookieFile = getCookieFile();
   const poToken = await generatePoToken();
@@ -328,72 +303,60 @@ async function tryDownload(videoUrl, outputFile) {
   // Strategy 1: PO Token only (no cookies) â€” most reliable, bypasses bot detection
   if (poToken) {
     for (const client of [null, "android_vr", "web", "mweb"]) {
-      let extractorArgs = client
+      const extractorArgs = client
         ? `youtube:player_client=${client};po_token=gvs:${poToken}`
         : `youtube:po_token=gvs:${poToken}`;
-      const args = [
-        "-x", "--audio-format", "mp3", "--audio-quality", "5",
-        "-o", outputFile, "--no-playlist", "--no-warnings", "--no-check-certificates",
-        "--extractor-args", extractorArgs,
-      ];
-      if (ffmpegPath) args.push("--ffmpeg-location", ffmpegPath);
-      args.push(videoUrl);
+      const args = buildYtDlpArgs({ outputFile, extractorArgs, ffmpegPath, videoUrl });
 
       const label = `${client || "default"}+pot`;
       console.log(`[DL] Trying ${label}...`);
-      const result = await runYtDlp(args);
-      if (result.ok && fs.existsSync(outputFile) && fs.statSync(outputFile).size > 1000) {
+      const result = await runYtDlp(args, { ytDlpPath });
+      if (result.ok && isValidDownload(outputFile)) {
         console.log(`[DL] âœ“ ${label} succeeded: ${fs.statSync(outputFile).size} bytes`);
         return { ok: true, method: label, results };
       }
-      const errLine = result.stderr.split("\n").find((l) => l.includes("ERROR")) || result.stderr.substring(0, 200);
+      const errLine = extractErrorLine(result.stderr, result.stderr.substring(0, 200));
       results.push({ method: label, error: errLine });
       console.log(`[DL] âœ— ${label}: ${errLine}`);
-      try { if (fs.existsSync(outputFile)) fs.unlinkSync(outputFile); } catch (e) {}
+      safeUnlink(outputFile);
     }
   }
 
   // Strategy 2: Cookies + PO Token
   if (cookieFile && poToken) {
     for (const client of ["web", "mweb", "android"]) {
-      const args = [
-        "-x", "--audio-format", "mp3", "--audio-quality", "5",
-        "-o", outputFile, "--no-playlist", "--no-warnings", "--no-check-certificates",
-        "--extractor-args", `youtube:player_client=${client};po_token=gvs:${poToken}`,
-        "--cookies", cookieFile,
-      ];
-      if (ffmpegPath) args.push("--ffmpeg-location", ffmpegPath);
-      args.push(videoUrl);
+      const args = buildYtDlpArgs({
+        outputFile,
+        extractorArgs: `youtube:player_client=${client};po_token=gvs:${poToken}`,
+        cookieFile, ffmpegPath, videoUrl,
+      });
 
       const label = `${client}+cookies+pot`;
       console.log(`[DL] Trying ${label}...`);
-      const result = await runYtDlp(args);
-      if (result.ok && fs.existsSync(outputFile) && fs.statSync(outputFile).size > 1000) {
+      const result = await runYtDlp(args, { ytDlpPath });
+      if (result.ok && isValidDownload(outputFile)) {
         console.log(`[DL] âœ“ ${label} succeeded: ${fs.statSync(outputFile).size} bytes`);
         return { ok: true, method: label, results };
       }
-      results.push({ method: label, error: result.stderr.split("\n").find((l) => l.includes("ERROR")) || "failed" });
-      try { if (fs.existsSync(outputFile)) fs.unlinkSync(outputFile); } catch (e) {}
+      results.push({ method: label, error: extractErrorLine(result.stderr) });
+      safeUnlink(outputFile);
     }
   }
 
   // Strategy 3: Cookies only (last resort)
   if (cookieFile) {
     for (const client of ["web", "android_vr"]) {
-      const args = [
-        "-x", "--audio-format", "mp3", "--audio-quality", "5",
-        "-o", outputFile, "--no-playlist", "--no-warnings", "--no-check-certificates",
-        "--extractor-args", `youtube:player_client=${client}`,
-        "--cookies", cookieFile,
-      ];
-      if (ffmpegPath) args.push("--ffmpeg-location", ffmpegPath);
-      args.push(videoUrl);
+      const args = buildYtDlpArgs({
+        outputFile,
+        extractorArgs: `youtube:player_client=${client}`,
+        cookieFile, ffmpegPath, videoUrl,
+      });
       const label = `${client}+cookies`;
-      const result = await runYtDlp(args);
-      if (result.ok && fs.existsSync(outputFile) && fs.statSync(outputFile).size > 1000)
+      const result = await runYtDlp(args, { ytDlpPath });
+      if (result.ok && isValidDownload(outputFile))
         return { ok: true, method: label, results };
       results.push({ method: label, error: "failed" });
-      try { if (fs.existsSync(outputFile)) fs.unlinkSync(outputFile); } catch (e) {}
+      safeUnlink(outputFile);
     }
   }
 
@@ -427,7 +390,7 @@ app.get("/health", (req, res) => {
 
 app.get("/debug", async (req, res) => {
   let ytDlpVersion = null;
-  try { ytDlpVersion = (await execFileAsync("yt-dlp", ["--version"], { timeout: 5000 })).stdout.trim(); } catch (e) {}
+  try { ytDlpVersion = (await execFileAsync(ytDlpPath, ["--version"], { timeout: 5000 })).stdout.trim(); } catch (e) {}
 
   let pipPlugin = false;
   try {
@@ -449,13 +412,14 @@ app.get("/debug", async (req, res) => {
 
   // Check if youtubei.js is available
   let youtubeiAvailable = false;
-  try { require("youtubei.js"); youtubeiAvailable = true; } catch (e) {}
+  try { await import("youtubei.js"); youtubeiAvailable = true; } catch (e) {}
 
   res.json({
     ffmpeg: !!ffmpeg,
     spotify: !!process.env.SPOTIFY_CLIENT_ID,
     cookies: getCookieFile() ? "configured" : "not configured",
     yt_dlp_version: ytDlpVersion,
+    yt_dlp_path: ytDlpPath,
     has_po_token: !!cachedPoToken,
     pip_plugin_installed: pipPlugin,
     pot_provider_running: potProviderRunning,
@@ -493,21 +457,21 @@ app.post("/metadata", async (req, res) => {
   const { url } = req.body;
   if (!url) return res.status(400).json({ success: false, error: "No URL provided" });
   try {
-    const match = url.match(/spotify\.com\/(track|album|playlist)\/([a-zA-Z0-9]+)/);
-    if (!match) return res.status(400).json({ success: false, error: "Invalid Spotify link" });
-    const type = match[1], id = match[2];
+    const parsed = parseSpotifyUrl(url);
+    if (!parsed) return res.status(400).json({ success: false, error: "Invalid Spotify link" });
+    const { type, id } = parsed;
     await ensureSpotifyToken();
     if (type === "track") {
       const d = (await spotifyApi.getTrack(id)).body;
-      res.json({ success: true, type, id, title: d.name, artist: d.artists.map((a) => a.name).join(", "), album: d.album.name, artwork: d.album.images[0]?.url || "", duration: d.duration_ms, url });
+      res.json({ success: true, type, id, title: d.name, artist: joinArtists(d.artists), album: d.album.name, artwork: firstImageUrl(d.album.images), duration: d.duration_ms, url });
     } else if (type === "album") {
       const d = (await spotifyApi.getAlbum(id)).body;
-      const tracks = d.tracks.items.map((t) => ({ title: t.name, artist: t.artists.map((a) => a.name).join(", "), duration: t.duration_ms, trackNumber: t.track_number, spotifyUrl: t.external_urls?.spotify || "", spotifyId: t.id }));
-      res.json({ success: true, type, id, title: d.name, artist: d.artists.map((a) => a.name).join(", "), album: d.name, artwork: d.images[0]?.url || "", trackCount: d.tracks.items.length, tracks, url });
+      const tracks = d.tracks.items.map((t) => ({ title: t.name, artist: joinArtists(t.artists), duration: t.duration_ms, trackNumber: t.track_number, spotifyUrl: t.external_urls?.spotify || "", spotifyId: t.id }));
+      res.json({ success: true, type, id, title: d.name, artist: joinArtists(d.artists), album: d.name, artwork: firstImageUrl(d.images), trackCount: d.tracks.items.length, tracks, url });
     } else if (type === "playlist") {
       const d = (await spotifyApi.getPlaylist(id)).body;
-      const tracks = d.tracks.items.filter((item) => item.track).map((item) => ({ title: item.track.name, artist: item.track.artists.map((a) => a.name).join(", "), album: item.track.album?.name || "", duration: item.track.duration_ms, spotifyUrl: item.track.external_urls?.spotify || "", spotifyId: item.track.id, artwork: item.track.album?.images?.[0]?.url || "" }));
-      res.json({ success: true, type, id, title: d.name, artist: d.owner?.display_name || "Various Artists", album: d.name, artwork: d.images[0]?.url || "", trackCount: tracks.length, tracks, url });
+      const tracks = d.tracks.items.filter((item) => item.track).map((item) => ({ title: item.track.name, artist: joinArtists(item.track.artists), album: item.track.album?.name || "", duration: item.track.duration_ms, spotifyUrl: item.track.external_urls?.spotify || "", spotifyId: item.track.id, artwork: firstImageUrl(item.track.album?.images) }));
+      res.json({ success: true, type, id, title: d.name, artist: d.owner?.display_name || "Various Artists", album: d.name, artwork: firstImageUrl(d.images), trackCount: tracks.length, tracks, url });
     }
   } catch (error) {
     res.status(500).json({ success: false, error: "Failed: " + error.message });
@@ -520,17 +484,17 @@ app.post("/download", async (req, res) => {
   let artworkPath = null, rawFile = null, taggedFile = null;
   const tempFiles = [];
   try {
-    const match = url.match(/spotify\.com\/(track|album|playlist)\/([a-zA-Z0-9]+)/);
-    if (!match) return res.status(400).json({ success: false, error: "Invalid Spotify link" });
-    const type = match[1], id = match[2];
+    const parsed = parseSpotifyUrl(url);
+    if (!parsed) return res.status(400).json({ success: false, error: "Invalid Spotify link" });
+    const { type, id } = parsed;
     if (type !== "track") return res.status(400).json({ success: false, error: "Only individual tracks supported." });
 
     await ensureSpotifyToken();
     const track = (await spotifyApi.getTrack(id)).body;
-    const artistName = track.artists.map((a) => a.name).join(", ");
+    const artistName = joinArtists(track.artists);
     const trackName = track.name;
     const albumName = track.album.name;
-    const artworkUrl = track.album.images[0]?.url || "";
+    const artworkUrl = firstImageUrl(track.album.images);
 
     const searchResults = await ytSearch(`${artistName} ${trackName}`);
     const video = searchResults.videos[0];
@@ -584,28 +548,47 @@ app.post("/download", async (req, res) => {
     if (!res.headersSent) res.status(500).json({ success: false, error: "Download failed: " + error.message });
   }
   function cleanup() {
-    [artworkPath, ...tempFiles].forEach((f) => {
-      try { if (f && fs.existsSync(f)) fs.unlinkSync(f); } catch (e) {}
-    });
+    [artworkPath, ...tempFiles].forEach((f) => safeUnlink(f));
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, async () => {
-  console.log(`SideCut backend running on port ${PORT}`);
-  console.log(`HOME: ${process.env.HOME}`);
-  console.log(`Node: ${process.version}`);
 
-  // Start the PO Token provider server (for pip plugin auto-connect)
-  startPotProviderServer();
+function start() {
+  return app.listen(PORT, async () => {
+    console.log(`SideCut backend running on port ${PORT}`);
+    console.log(`HOME: ${process.env.HOME}`);
+    console.log(`Node: ${process.version}`);
 
-  // Pre-generate PO Token at startup so errors are visible in Render logs
-  console.log("=== Pre-generating PO Token at startup ===");
-  const token = await generatePoToken();
-  if (token) {
-    console.log("âœ“âœ“âœ“ PO Token ready at startup âœ“âœ“âœ“");
-  } else {
-    console.log("âš âš âš  PO Token generation FAILED at startup âš âš âš ");
-    console.log("âš  Check the [POT] error messages above");
-  }
-});
+    // Start the PO Token provider server (for pip plugin auto-connect)
+    startPotProviderServer();
+
+    // Pre-generate PO Token at startup so errors are visible in Render logs
+    console.log("=== Pre-generating PO Token at startup ===");
+    const token = await generatePoToken();
+    if (token) {
+      console.log("âœ“âœ“âœ“ PO Token ready at startup âœ“âœ“âœ“");
+    } else {
+      console.log("âš âš âš  PO Token generation FAILED at startup âš âš âš ");
+      console.log("âš  Check the [POT] error messages above");
+    }
+  });
+}
+
+if (require.main === module) {
+  start();
+}
+
+module.exports = {
+  app,
+  start,
+  parseSpotifyUrl,
+  getCookieFile,
+  downloadFile,
+  tagMp3,
+  fetchFn,
+  runYtDlp,
+  ensureSpotifyToken,
+  generatePoToken,
+  startPotProviderServer,
+};
