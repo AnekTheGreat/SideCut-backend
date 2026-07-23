@@ -2,9 +2,10 @@ const express = require("express");
 const cors = require("cors");
 const https = require("https");
 const fs = require("fs");
-const { execFile } = require("child_process");
+const { execFile, exec } = require("child_process");
 const { promisify } = require("util");
 const execFileAsync = promisify(execFile);
+const execAsync = promisify(exec);
 const SpotifyWebApi = require("spotify-web-api-node");
 const ytSearch = require("yt-search");
 
@@ -62,121 +63,119 @@ function getCookieFile() {
   return null;
 }
 
-// ─── Download with system yt-dlp ───
-// Tries different YouTube client + cookie combinations.
-// Key insight from yt-dlp PO Token docs:
-//   - android, ios, tv: PO Token NOT needed. Formats NOT DRM'd when cookies are passed.
-//   - web, mweb: PO Token needed (GVS). Cookies provide auth but not PO token → "format not available"
-//   - android_vr: PO Token not needed, but doesn't use cookies → bot detection from cloud IPs
-async function downloadWithSystemYtDlp(videoUrl, outputFile, client, useCookies) {
+// ─── Run yt-dlp and capture FULL output ───
+async function runYtDlp(args) {
   try {
+    const { stdout, stderr } = await execFileAsync("yt-dlp", args, { timeout: 120000, maxBuffer: 1024 * 1024 * 50 });
+    return { ok: true, stdout, stderr };
+  } catch (e) {
+    return { ok: false, stdout: e.stdout || "", stderr: e.stderr || e.message || "" };
+  }
+}
+
+// ─── Download audio: try multiple format strategies ───
+async function downloadAudio(videoUrl, outputFile, useCookies) {
+  const cookieFile = useCookies ? getCookieFile() : null;
+  const hasCookies = !!cookieFile;
+  
+  // Strategy list: [client, formatArgs, extractAudio]
+  // Key insight: "format not available" means audio-only formats are missing.
+  // Fix: try downloading video+audio (format "best") and extract audio with ffmpeg.
+  const strategies = [];
+  
+  if (hasCookies) {
+    // With cookies — these clients don't need PO token
+    // Try audio-only first, then video+audio as fallback
+    strategies.push({ client: "android", fmt: "bestaudio/best", extractAudio: true, useCookies: true });
+    strategies.push({ client: "tv", fmt: "bestaudio/best", extractAudio: true, useCookies: true });
+    strategies.push({ client: "ios", fmt: "bestaudio/best", extractAudio: true, useCookies: true });
+    // Fallback: download video+audio, extract audio later
+    strategies.push({ client: "android", fmt: "best", extractAudio: false, useCookies: true });
+    strategies.push({ client: "tv", fmt: "best", extractAudio: false, useCookies: true });
+  }
+  
+  // Without cookies — android_vr doesn't need PO token
+  strategies.push({ client: "android_vr", fmt: "bestaudio/best", extractAudio: true, useCookies: false });
+  strategies.push({ client: "android_vr", fmt: "best", extractAudio: false, useCookies: false });
+  
+  const results = [];
+  
+  for (const s of strategies) {
+    const label = `yt-dlp[${s.client}+${s.fmt}${s.useCookies ? "+cookies" : ""}]`;
+    console.log(`Trying ${label}...`);
+    
     const args = [
-      "-x", "--audio-format", "mp3", "--audio-quality", "5",
-      "-o", outputFile,
       "--no-playlist", "--no-warnings", "--no-check-certificates",
+      "--no-check-formats", // Skip format availability check
+      "-o", outputFile.replace(/\.mp3$/, ".%(ext)s"),
+      "--format", s.fmt,
     ];
-    if (client) {
-      args.push("--extractor-args", `youtube:player_client=${client}`);
+    
+    if (s.extractAudio) {
+      args.push("-x", "--audio-format", "mp3", "--audio-quality", "5");
     }
-    if (useCookies) {
-      const cookieFile = getCookieFile();
-      if (cookieFile) { args.push("--cookies", cookieFile); }
-      else { useCookies = false; }
+    
+    if (s.client) {
+      args.push("--extractor-args", `youtube:player_client=${s.client}`);
     }
+    
+    if (s.useCookies && cookieFile) {
+      args.push("--cookies", cookieFile);
+    }
+    
     if (ffmpegPath) args.push("--ffmpeg-location", ffmpegPath);
     args.push(videoUrl);
-
-    const label = `yt-dlp[${client || "default"}${useCookies ? "+cookies" : ""}]`;
-    console.log(`Running ${label}`);
-    await execFileAsync("yt-dlp", args, { timeout: 120000, maxBuffer: 1024 * 1024 * 10 });
-
-    if (fs.existsSync(outputFile) && fs.statSync(outputFile).size > 1000) {
-      console.log(`✓ ${label} succeeded: ${fs.statSync(outputFile).size} bytes`);
-      return { ok: true, method: label };
+    
+    const result = await runYtDlp(args);
+    
+    if (result.ok) {
+      // Find the actual output file (extension might vary)
+      const baseName = outputFile.replace(/\.mp3$/, "");
+      const possibleFiles = [outputFile, `${baseName}.mp3`, `${baseName}.webm`, `${baseName}.m4a`, `${baseName}.mp4`, `${baseName}.mkv`];
+      let foundFile = null;
+      for (const f of possibleFiles) {
+        if (fs.existsSync(f) && fs.statSync(f).size > 1000) { foundFile = f; break; }
+      }
+      
+      if (foundFile) {
+        // If it's not MP3, convert with ffmpeg
+        if (foundFile !== outputFile) {
+          if (ffmpeg && ffmpegPath) {
+            try {
+              await new Promise((resolve, reject) => {
+                ffmpeg().input(foundFile).toFormat("mp3").audioBitrate(192).save(outputFile)
+                  .on("end", resolve).on("error", reject);
+              });
+              try { fs.unlinkSync(foundFile); } catch(e) {}
+            } catch (e) {
+              fs.copyFileSync(foundFile, outputFile);
+              try { fs.unlinkSync(foundFile); } catch(e) {}
+            }
+          } else {
+            fs.copyFileSync(foundFile, outputFile);
+            try { fs.unlinkSync(foundFile); } catch(e) {}
+          }
+        }
+        
+        if (fs.existsSync(outputFile) && fs.statSync(outputFile).size > 1000) {
+          console.log(`✓ ${label} succeeded: ${fs.statSync(outputFile).size} bytes`);
+          return { ok: true, method: label, results };
+        }
+      }
     }
-    return { ok: false, method: label, error: "File too small or missing" };
-  } catch (e) {
-    const msg = String(e.message || e).substring(0, 300);
-    console.log(`✗ yt-dlp[${client || "default"}${useCookies ? "+cookies" : ""}] failed: ${msg}`);
-    return { ok: false, method: `yt-dlp[${client || "default"}${useCookies ? "+cookies" : ""}]`, error: msg };
-  }
-}
-
-// ─── Download with npm youtube-dl-exec ───
-async function downloadWithNpmYtDlp(videoUrl, outputFile, client, useCookies) {
-  if (!youtubedl) return { ok: false, method: "npm-yt-dlp", error: "package not loaded" };
-  try {
-    const opts = {
-      extractAudio: true, audioFormat: "mp3", audioQuality: 5,
-      output: outputFile, noPlaylist: true, noWarnings: true,
-    };
-    if (client) opts.extractorArgs = `youtube:player_client=${client}`;
-    if (useCookies) {
-      const cookieFile = getCookieFile();
-      if (cookieFile) opts.cookies = cookieFile;
-      else useCookies = false;
-    }
-    if (ffmpegPath) opts.ffmpegLocation = ffmpegPath;
-    await youtubedl(videoUrl, opts);
-
-    const label = `npm[${client || "default"}${useCookies ? "+cookies" : ""}]`;
-    if (fs.existsSync(outputFile) && fs.statSync(outputFile).size > 1000) {
-      console.log(`✓ ${label} succeeded: ${fs.statSync(outputFile).size} bytes`);
-      return { ok: true, method: label };
-    }
-    return { ok: false, method: label, error: "File too small or missing" };
-  } catch (e) {
-    const msg = String(e.message || e).substring(0, 300);
-    console.log(`✗ npm-yt-dlp failed: ${msg}`);
-    return { ok: false, method: `npm[${client || "default"}${useCookies ? "+cookies" : ""}]`, error: msg };
-  }
-}
-
-// ─── Try all download methods ───
-async function tryAllDownloads(videoUrl, outputFile) {
-  const hasCookies = !!getCookieFile();
-  const results = [];
-
-  // Priority order based on yt-dlp PO Token docs:
-  // 1. android + cookies (no PO token needed, non-DRM with cookies)
-  // 2. tv + cookies (same)
-  // 3. ios + cookies (same)
-  // 4. web + cookies (needs PO token — may get "format not available")
-  // 5. android_vr without cookies (no PO token, no cookies — bot detection may block)
-  // 6. default without cookies
-  
-  const cookieClients = ["android", "tv", "ios", "web"];
-  const noCookieClients = ["android_vr", "android", "tv"];
-  
-  if (hasCookies) {
-    for (const client of cookieClients) {
-      const r = await downloadWithSystemYtDlp(videoUrl, outputFile, client, true);
-      results.push(r);
-      if (r.ok) return { success: true, result: r, results };
-    }
+    
+    const errLine = result.stderr.split("\n").find(l => l.includes("ERROR")) || result.stderr.substring(0, 200);
+    results.push({ method: label, error: errLine || "Unknown error" });
+    console.log(`✗ ${label} failed: ${errLine}`);
+    
+    // Clean up any partial files
+    const baseName = outputFile.replace(/\.mp3$/, "");
+    [outputFile, `${baseName}.mp3`, `${baseName}.webm`, `${baseName}.m4a`, `${baseName}.mp4`, `${baseName}.mkv`].forEach(f => {
+      try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch(e) {}
+    });
   }
   
-  for (const client of noCookieClients) {
-    const r = await downloadWithSystemYtDlp(videoUrl, outputFile, client, false);
-    results.push(r);
-    if (r.ok) return { success: true, result: r, results };
-  }
-
-  // Also try npm package as last resort
-  if (hasCookies) {
-    for (const client of ["android", "tv"]) {
-      const r = await downloadWithNpmYtDlp(videoUrl, outputFile, client, true);
-      results.push(r);
-      if (r.ok) return { success: true, result: r, results };
-    }
-  }
-  {
-    const r = await downloadWithNpmYtDlp(videoUrl, outputFile, "android_vr", false);
-    results.push(r);
-    if (r.ok) return { success: true, result: r, results };
-  }
-
-  return { success: false, result: null, results };
+  return { ok: false, results };
 }
 
 // ─── Tag MP3 ───
@@ -229,12 +228,60 @@ app.get("/debug", async (req, res) => {
   });
 });
 
+// DIAGNOSTIC: Show available formats with cookies
+app.get("/diag", async (req, res) => {
+  const videoUrl = "https://www.youtube.com/watch?v=4NRXx6U8ABQ";
+  const cookieFile = getCookieFile();
+  const output = {};
+  
+  // List formats with different clients
+  const clients = cookieFile ? ["android", "tv", "web"] : ["android_vr"];
+  
+  for (const client of clients) {
+    const args = ["--list-formats", "--no-playlist", "--no-warnings", "--extractor-args", `youtube:player_client=${client}`];
+    if (cookieFile) args.push("--cookies", cookieFile);
+    args.push(videoUrl);
+    
+    const result = await runYtDlp(args);
+    output[client + (cookieFile ? "_cookies" : "")] = {
+      ok: result.ok,
+      stderr: result.stderr.substring(0, 2000),
+      stdout: result.stdout.substring(0, 3000),
+    };
+  }
+  
+  // Also try dumping JSON to see format details
+  if (cookieFile) {
+    const args = ["--dump-json", "--no-playlist", "--no-warnings", "--extractor-args", "youtube:player_client=android", "--cookies", cookieFile, videoUrl];
+    const result = await runYtDlp(args);
+    if (result.ok) {
+      try {
+        const json = JSON.parse(result.stdout);
+        output.json_dump = {
+          title: json.title,
+          formats: (json.formats || []).map(f => ({
+            format_id: f.format_id, ext: f.ext, acodec: f.acodec, vcodec: f.vcodec,
+            abr: f.abr, filesize: f.filesize, url: f.url ? "present" : "missing",
+            protocol: f.protocol, drm: f.drm || "none",
+          })),
+        };
+      } catch (e) {
+        output.json_dump = { error: e.message, raw: result.stdout.substring(0, 500) };
+      }
+    } else {
+      output.json_dump = { error: result.stderr.substring(0, 500) };
+    }
+  }
+  
+  res.json(output);
+});
+
 app.get("/test-download", async (req, res) => {
   const testUrl = "https://www.youtube.com/watch?v=4NRXx6U8ABQ";
   const testFile = "/tmp/sidecut_test.mp3";
-  const { success, result, results } = await tryAllDownloads(testUrl, testFile);
+  const { ok, method, results } = await downloadAudio(testUrl, testFile, !!getCookieFile());
   try { if (fs.existsSync(testFile)) fs.unlinkSync(testFile); } catch(e) {}
-  res.json({ success, results, winningMethod: result?.method || null });
+  res.json({ success: ok, winningMethod: method, results: results || [] });
 });
 
 // ─── /metadata ───
@@ -291,20 +338,19 @@ app.post("/download", async (req, res) => {
     rawFile = `/tmp/sidecut_raw_${id}_${Date.now()}.mp3`;
     tempFiles.push(rawFile);
 
-    const { success, result, results } = await tryAllDownloads(video.url, rawFile);
+    const { ok, method, results } = await downloadAudio(video.url, rawFile, !!getCookieFile());
     
-    if (!success) {
-      const errors = results.map(r => `[${r.method}]: ${r.error}`).join(" | ");
-      const hasCookies = !!getCookieFile();
+    if (!ok) {
+      const errors = (results || []).map(r => `[${r.method}]: ${r.error}`).join(" | ");
       return res.status(502).json({
         success: false,
         error: `Download failed. ${errors}`,
-        hint: hasCookies ? "Cookies are configured but all clients failed. Cookies may be expired — re-export from youtube.com." : "Set YOUTUBE_COOKIES env var. Install 'Get cookies.txt LOCALLY' extension, visit youtube.com, export cookies.",
+        hint: "Check /diag for format details and /debug for cookie info.",
         video: { title: video.title, url: video.url, id: video.videoId }
       });
     }
 
-    console.log(`Downloaded via ${result.method}: ${fs.statSync(rawFile).size} bytes`);
+    console.log(`Downloaded via ${method}: ${fs.statSync(rawFile).size} bytes`);
 
     taggedFile = `/tmp/sidecut_tagged_${id}_${Date.now()}.mp3`;
     tempFiles.push(taggedFile);
