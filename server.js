@@ -16,7 +16,7 @@ try {
   ffmpeg.setFfmpegPath(ffmpegPath);
 } catch (e) {}
 
-// ─── PO Token Generator (bgutils-js + JSDOM, NO Chrome needed) ───
+// â”€â”€â”€ PO Token Generator (bgutils-js + JSDOM, NO Chrome needed) â”€â”€â”€
 let bgUtils = null;
 let jsdomReady = false;
 let cachedPoToken = null;
@@ -161,17 +161,17 @@ async function generatePoToken(contentBinding) {
 
     cachedPoToken = poToken;
     poTokenExpiry = Date.now() + Math.min(ttl - 300, 6 * 3600) * 1000;
-    console.log("[POT] ✓ SUCCESS! PO Token:", poToken.substring(0, 40) + "...");
+    console.log("[POT] âœ“ SUCCESS! PO Token:", poToken.substring(0, 40) + "...");
     return poToken;
   } catch (e) {
     console.warn = origWarn;
-    console.log("[POT] ✗ FAILED:", e.message);
+    console.log("[POT] âœ— FAILED:", e.message);
     if (e.stack) console.log("[POT] Stack:", e.stack.split("\n").slice(0, 3).join("\n"));
     return null;
   }
 }
 
-// ─── Mini PO Token Provider Server (port 4416) ───
+// â”€â”€â”€ Mini PO Token Provider Server (port 4416) â”€â”€â”€
 // The bgutil-ytdlp-pot-provider pip plugin auto-connects to this
 function startPotProviderServer() {
   try {
@@ -210,7 +210,7 @@ function startPotProviderServer() {
 
     potApp.listen(4416, "127.0.0.1", () => {
       potProviderRunning = true;
-      console.log("[POT] ✓ Provider server running on port 4416");
+      console.log("[POT] âœ“ Provider server running on port 4416");
     });
   } catch (e) {
     console.log("[POT] Provider server failed to start:", e.message);
@@ -221,7 +221,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ─── Spotify API ───
+// â”€â”€â”€ Spotify API â”€â”€â”€
 const spotifyApi = new SpotifyWebApi({
   clientId: process.env.SPOTIFY_CLIENT_ID || "",
   clientSecret: process.env.SPOTIFY_CLIENT_SECRET || "",
@@ -281,10 +281,10 @@ async function tryDownload(videoUrl, outputFile) {
   const results = [];
 
   if (!poToken) {
-    console.log("[DL] ⚠ No PO Token available - downloads will likely fail");
+    console.log("[DL] âš  No PO Token available - downloads will likely fail");
   }
 
-  // Strategy 1: PO Token only (no cookies) — most reliable, bypasses bot detection
+  // Strategy 1: PO Token only (no cookies) â€” most reliable, bypasses bot detection
   if (poToken) {
     for (const client of [null, "android_vr", "web", "mweb"]) {
       let extractorArgs = client
@@ -302,12 +302,12 @@ async function tryDownload(videoUrl, outputFile) {
       console.log(`[DL] Trying ${label}...`);
       const result = await runYtDlp(args);
       if (result.ok && fs.existsSync(outputFile) && fs.statSync(outputFile).size > 1000) {
-        console.log(`[DL] ✓ ${label} succeeded: ${fs.statSync(outputFile).size} bytes`);
+        console.log(`[DL] âœ“ ${label} succeeded: ${fs.statSync(outputFile).size} bytes`);
         return { ok: true, method: label, results };
       }
       const errLine = result.stderr.split("\n").find((l) => l.includes("ERROR")) || result.stderr.substring(0, 200);
       results.push({ method: label, error: errLine });
-      console.log(`[DL] ✗ ${label}: ${errLine}`);
+      console.log(`[DL] âœ— ${label}: ${errLine}`);
       try { if (fs.existsSync(outputFile)) fs.unlinkSync(outputFile); } catch (e) {}
     }
   }
@@ -328,7 +328,7 @@ async function tryDownload(videoUrl, outputFile) {
       console.log(`[DL] Trying ${label}...`);
       const result = await runYtDlp(args);
       if (result.ok && fs.existsSync(outputFile) && fs.statSync(outputFile).size > 1000) {
-        console.log(`[DL] ✓ ${label} succeeded: ${fs.statSync(outputFile).size} bytes`);
+        console.log(`[DL] âœ“ ${label} succeeded: ${fs.statSync(outputFile).size} bytes`);
         return { ok: true, method: label, results };
       }
       results.push({ method: label, error: result.stderr.split("\n").find((l) => l.includes("ERROR")) || "failed" });
@@ -371,7 +371,7 @@ function tagMp3(inputFile, outputFile, metadata, artworkPath) {
   });
 }
 
-// ─── Routes ───
+// â”€â”€â”€ Routes â”€â”€â”€
 app.get("/", (req, res) => res.send("SideCut backend is online!"));
 
 app.get("/health", (req, res) => {
@@ -552,9 +552,9 @@ app.listen(PORT, async () => {
   console.log("=== Pre-generating PO Token at startup ===");
   const token = await generatePoToken();
   if (token) {
-    console.log("✓✓✓ PO Token ready at startup ✓✓✓");
+    console.log("âœ“âœ“âœ“ PO Token ready at startup âœ“âœ“âœ“");
   } else {
-    console.log("⚠⚠⚠ PO Token generation FAILED at startup ⚠⚠⚠");
-    console.log("⚠ Check the [POT] error messages above");
+    console.log("âš âš âš  PO Token generation FAILED at startup âš âš âš ");
+    console.log("âš  Check the [POT] error messages above");
   }
 });
