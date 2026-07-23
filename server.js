@@ -52,17 +52,20 @@ let cookieFilePath = null;
 function getCookieFile() {
   if (cookieFilePath && fs.existsSync(cookieFilePath)) return cookieFilePath;
   
-  // Option 1: YOUTUBE_COOKIE_FILE env var points to a file path
   if (process.env.YOUTUBE_COOKIE_FILE && fs.existsSync(process.env.YOUTUBE_COOKIE_FILE)) {
     cookieFilePath = process.env.YOUTUBE_COOKIE_FILE;
     console.log("✓ Using cookies from YOUTUBE_COOKIE_FILE:", cookieFilePath);
     return cookieFilePath;
   }
   
-  // Option 2: YOUTUBE_COOKIES env var contains the cookie content directly
   if (process.env.YOUTUBE_COOKIES) {
     cookieFilePath = "/tmp/yt_cookies.txt";
     fs.writeFileSync(cookieFilePath, process.env.YOUTUBE_COOKIES);
+    // Validate it looks like a Netscape cookie file
+    const content = fs.readFileSync(cookieFilePath, "utf8");
+    if (!content.includes(".youtube.com") && !content.includes(".google.com")) {
+      console.log("⚠ Cookie file doesn't contain YouTube cookies — may not work");
+    }
     console.log("✓ Using cookies from YOUTUBE_COOKIES env var");
     return cookieFilePath;
   }
@@ -71,18 +74,32 @@ function getCookieFile() {
 }
 
 // ─── Download with system yt-dlp ───
+// KEY FIX: When cookies are available, use 'web' client (sends cookies + extracts PO token from them)
+//          When no cookies, use 'android_vr' client (doesn't need PO token, but bot detection may block)
 async function downloadWithSystemYtDlp(videoUrl, outputFile, useCookies) {
   try {
     const args = [
       "-x", "--audio-format", "mp3", "--audio-quality", "5",
       "-o", outputFile,
       "--no-playlist", "--no-warnings", "--no-check-certificates",
-      "--extractor-args", "youtube:player_client=android_vr",
     ];
+    
     if (useCookies) {
       const cookieFile = getCookieFile();
-      if (cookieFile) { args.push("--cookies", cookieFile); }
+      if (cookieFile) {
+        args.push("--cookies", cookieFile);
+        // Use web client with cookies — this is the key fix
+        args.push("--extractor-args", "youtube:player_client=web");
+      } else {
+        useCookies = false; // No cookie file, fall through to android_vr
+      }
     }
+    
+    if (!useCookies) {
+      // No cookies — use android_vr (doesn't need PO token)
+      args.push("--extractor-args", "youtube:player_client=android_vr");
+    }
+    
     if (ffmpegPath) args.push("--ffmpeg-location", ffmpegPath);
     args.push(videoUrl);
     
@@ -91,12 +108,12 @@ async function downloadWithSystemYtDlp(videoUrl, outputFile, useCookies) {
     
     if (fs.existsSync(outputFile) && fs.statSync(outputFile).size > 1000) {
       console.log(`✓ yt-dlp succeeded: ${fs.statSync(outputFile).size} bytes`);
-      return { ok: true, method: useCookies ? "yt-dlp+cookies" : "yt-dlp+android_vr" };
+      return { ok: true, method: useCookies ? "yt-dlp+web+cookies" : "yt-dlp+android_vr" };
     }
     return { ok: false, method: "system-yt-dlp", error: "File too small or missing" };
   } catch (e) {
-    console.log("✗ system yt-dlp failed:", String(e.message).substring(0, 200));
-    return { ok: false, method: "system-yt-dlp", error: String(e.message).substring(0, 200) };
+    console.log("✗ system yt-dlp failed:", String(e.message).substring(0, 300));
+    return { ok: false, method: "system-yt-dlp", error: String(e.message).substring(0, 300) };
   }
 }
 
@@ -107,23 +124,33 @@ async function downloadWithNpmYtDlp(videoUrl, outputFile, useCookies) {
     const opts = {
       extractAudio: true, audioFormat: "mp3", audioQuality: 5,
       output: outputFile, noPlaylist: true, noWarnings: true,
-      extractorArgs: "youtube:player_client=android_vr",
     };
+    
     if (useCookies) {
       const cookieFile = getCookieFile();
-      if (cookieFile) opts.cookies = cookieFile;
+      if (cookieFile) {
+        opts.cookies = cookieFile;
+        opts.extractorArgs = "youtube:player_client=web";
+      } else {
+        useCookies = false;
+      }
     }
+    
+    if (!useCookies) {
+      opts.extractorArgs = "youtube:player_client=android_vr";
+    }
+    
     if (ffmpegPath) opts.ffmpegLocation = ffmpegPath;
     await youtubedl(videoUrl, opts);
     
     if (fs.existsSync(outputFile) && fs.statSync(outputFile).size > 1000) {
       console.log(`✓ youtube-dl-exec succeeded: ${fs.statSync(outputFile).size} bytes`);
-      return { ok: true, method: useCookies ? "npm-yt-dlp+cookies" : "npm-yt-dlp" };
+      return { ok: true, method: useCookies ? "npm-yt-dlp+web+cookies" : "npm-yt-dlp" };
     }
     return { ok: false, method: "npm-yt-dlp", error: "File too small or missing" };
   } catch (e) {
-    console.log("✗ youtube-dl-exec failed:", String(e.message).substring(0, 200));
-    return { ok: false, method: "npm-yt-dlp", error: String(e.message).substring(0, 200) };
+    console.log("✗ youtube-dl-exec failed:", String(e.message).substring(0, 300));
+    return { ok: false, method: "npm-yt-dlp", error: String(e.message).substring(0, 300) };
   }
 }
 
@@ -160,6 +187,19 @@ app.get("/debug", async (req, res) => {
     ytDlpVersion = versionResult.stdout.trim();
   } catch (e) {}
   
+  const cookieFile = getCookieFile();
+  let cookieInfo = "not configured";
+  if (cookieFile) {
+    try {
+      const content = fs.readFileSync(cookieFile, "utf8");
+      const lines = content.split("\n").filter(l => l.trim() && !l.startsWith("#"));
+      const hasYt = content.includes(".youtube.com") || content.includes(".google.com");
+      cookieInfo = `configured (${lines.length} cookies, has YouTube: ${hasYt})`;
+    } catch (e) {
+      cookieInfo = "configured but error reading";
+    }
+  }
+  
   res.json({
     youtube_dl_exec: !!youtubedl,
     ffmpeg: !!ffmpeg,
@@ -167,7 +207,7 @@ app.get("/debug", async (req, res) => {
     spotify_client_id_set: !!process.env.SPOTIFY_CLIENT_ID,
     spotify_client_secret_set: !!process.env.SPOTIFY_CLIENT_SECRET,
     system_yt_dlp: ytDlpPath ? { path: ytDlpPath, version: ytDlpVersion } : null,
-    cookies_configured: !!getCookieFile(),
+    cookies: cookieInfo,
     node_version: process.version,
     platform: process.platform,
   });
@@ -179,26 +219,36 @@ app.get("/test-download", async (req, res) => {
   const results = [];
   const hasCookies = !!getCookieFile();
   
-  // Try with cookies first if available
+  // Method 1: yt-dlp with cookies + web client (the key fix)
   if (hasCookies) {
     const r = await downloadWithSystemYtDlp(testUrl, testFile, true);
     results.push(r);
     if (r.ok) { try { fs.unlinkSync(testFile); } catch(e) {} return res.json({ success: true, results }); }
   }
   
-  // Try without cookies (android_vr)
+  // Method 2: yt-dlp with android_vr (no cookies)
   const r1 = await downloadWithSystemYtDlp(testUrl, testFile, false);
   results.push(r1);
   if (r1.ok) { try { fs.unlinkSync(testFile); } catch(e) {} return res.json({ success: true, results }); }
   
-  const r2 = await downloadWithNpmYtDlp(testUrl, testFile, false);
-  results.push(r2);
-  if (r2.ok) { try { fs.unlinkSync(testFile); } catch(e) {} return res.json({ success: true, results }); }
+  // Method 3: npm youtube-dl-exec with cookies + web client
+  if (hasCookies) {
+    const r2 = await downloadWithNpmYtDlp(testUrl, testFile, true);
+    results.push(r2);
+    if (r2.ok) { try { fs.unlinkSync(testFile); } catch(e) {} return res.json({ success: true, results }); }
+  }
+  
+  // Method 4: npm youtube-dl-exec with android_vr
+  const r3 = await downloadWithNpmYtDlp(testUrl, testFile, false);
+  results.push(r3);
+  if (r3.ok) { try { fs.unlinkSync(testFile); } catch(e) {} return res.json({ success: true, results }); }
   
   res.json({ 
     success: false, 
     results,
-    hint: hasCookies ? "Cookies are configured but download still failed. Cookies may be expired — re-export from browser." : "No cookies configured. Set YOUTUBE_COOKIES env var with your YouTube cookies. See: https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp"
+    hint: hasCookies 
+      ? "Cookies are configured but download still failed with web client. Cookies may be expired or malformed. Check /debug for cookie info. Re-export fresh cookies from your browser."
+      : "No cookies configured. Set YOUTUBE_COOKIES env var with your YouTube cookies (Netscape format). Install 'Get cookies.txt LOCALLY' browser extension, visit youtube.com, export cookies."
   });
 });
 
@@ -278,14 +328,14 @@ app.post("/download", async (req, res) => {
       try { artworkPath = `/tmp/artwork_${id}.jpg`; await downloadFile(artworkUrl, artworkPath); } catch (e) { artworkPath = null; }
     }
 
-    // 4. Download audio — try methods in order
+    // 4. Download audio
     rawFile = `/tmp/sidecut_raw_${id}_${Date.now()}.mp3`;
     tempFiles.push(rawFile);
     const hasCookies = !!getCookieFile();
     const allResults = [];
     let downloadResult = null;
     
-    // Method 1: yt-dlp with cookies (if configured)
+    // Method 1: yt-dlp with cookies + web client (key fix)
     if (hasCookies) {
       downloadResult = await downloadWithSystemYtDlp(video.url, rawFile, true);
       allResults.push(downloadResult);
@@ -297,7 +347,13 @@ app.post("/download", async (req, res) => {
       allResults.push(downloadResult);
     }
     
-    // Method 3: npm youtube-dl-exec
+    // Method 3: npm youtube-dl-exec with cookies + web client
+    if (!downloadResult?.ok && hasCookies) {
+      downloadResult = await downloadWithNpmYtDlp(video.url, rawFile, true);
+      allResults.push(downloadResult);
+    }
+    
+    // Method 4: npm youtube-dl-exec with android_vr
     if (!downloadResult?.ok) {
       downloadResult = await downloadWithNpmYtDlp(video.url, rawFile, false);
       allResults.push(downloadResult);
@@ -306,19 +362,12 @@ app.post("/download", async (req, res) => {
     if (!downloadResult?.ok) {
       const errors = allResults.map(r => `[${r.method}]: ${r.error}`).join(" | ");
       const hint = hasCookies 
-        ? "Your cookies may be expired. Re-export from your browser and update the YOUTUBE_COOKIES env var."
-        : "YouTube is blocking this server's IP. You need to add YouTube cookies — see instructions below.";
+        ? "Cookies are configured but the web client download failed. Your cookies may be expired or in the wrong format. Check /debug for cookie details. Re-export fresh cookies from youtube.com using 'Get cookies.txt LOCALLY' extension."
+        : "YouTube is blocking this server's IP. Add YouTube cookies: install 'Get cookies.txt LOCALLY' browser extension, visit youtube.com while logged in, export cookies, set as YOUTUBE_COOKIES env var in Render.";
       return res.status(502).json({ 
         success: false, 
         error: `Download failed. ${errors}`,
         hint,
-        cookieInstructions: !hasCookies ? {
-          step1: "Install 'Get cookies.txt LOCALLY' browser extension",
-          step2: "Log into YouTube in your browser",
-          step3: "Export cookies as text using the extension",
-          step4: "In Render dashboard, add environment variable YOUTUBE_COOKIES with the cookie text content",
-          step5: "Redeploy the backend",
-        } : null,
         video: { title: video.title, url: video.url, id: video.videoId }
       });
     }
