@@ -17,6 +17,15 @@ try {
   ffmpeg.setFfmpegPath(ffmpegPath);
 } catch (e) {}
 
+// Resolve a usable yt-dlp binary. Prefer the one bundled by youtube-dl-exec
+// (installed via npm, so it always exists on hosts like Render without any
+// extra build step); fall back to a system-wide "yt-dlp" on PATH.
+let ytDlpPath = "yt-dlp";
+try {
+  const bundled = require("youtube-dl-exec").constants?.YOUTUBE_DL_PATH;
+  if (bundled && fs.existsSync(bundled)) ytDlpPath = bundled;
+} catch (e) {}
+
 // â”€â”€â”€ PO Token Generator (bgutils-js + JSDOM, NO Chrome needed) â”€â”€â”€
 let bgUtils = null;
 let jsdomReady = false;
@@ -88,7 +97,7 @@ async function generatePoToken(contentBinding) {
     console.log("[POT] Starting PO Token generation...");
     await setupJSDOM();
     const { botguard, webpo, utils } = await loadBgUtils();
-    const { Innertube } = require("youtubei.js");
+    const { Innertube } = await import("youtubei.js");
 
     // 1. Get visitor data (content binding)
     if (!contentBinding) {
@@ -315,9 +324,16 @@ function getCookieFile() {
   return null;
 }
 
+function parseSpotifyUrl(url) {
+  if (!url || typeof url !== "string") return null;
+  const match = url.match(/spotify\.com\/(track|album|playlist)\/([a-zA-Z0-9]+)/);
+  if (!match) return null;
+  return { type: match[1], id: match[2] };
+}
+
 async function runYtDlp(args, timeout = 120000) {
   return new Promise((resolve) => {
-    execFile("yt-dlp", args, { timeout, maxBuffer: 1024 * 1024 * 50, cwd: "/tmp" }, (err, stdout, stderr) => {
+    execFile(ytDlpPath, args, { timeout, maxBuffer: 1024 * 1024 * 50, cwd: "/tmp" }, (err, stdout, stderr) => {
       resolve({ ok: !err, stdout: stdout || "", stderr: stderr || (err ? err.message : "") });
     });
   });
@@ -434,7 +450,7 @@ app.get("/health", (req, res) => {
 
 app.get("/debug", requireAdmin, async (req, res) => {
   let ytDlpVersion = null;
-  try { ytDlpVersion = (await execFileAsync("yt-dlp", ["--version"], { timeout: 5000 })).stdout.trim(); } catch (e) {}
+  try { ytDlpVersion = (await execFileAsync(ytDlpPath, ["--version"], { timeout: 5000 })).stdout.trim(); } catch (e) {}
 
   let pipPlugin = false;
   try {
@@ -456,13 +472,14 @@ app.get("/debug", requireAdmin, async (req, res) => {
 
   // Check if youtubei.js is available
   let youtubeiAvailable = false;
-  try { require("youtubei.js"); youtubeiAvailable = true; } catch (e) {}
+  try { await import("youtubei.js"); youtubeiAvailable = true; } catch (e) {}
 
   res.json({
     ffmpeg: !!ffmpeg,
     spotify: !!process.env.SPOTIFY_CLIENT_ID,
     cookies: getCookieFile() ? "configured" : "not configured",
     yt_dlp_version: ytDlpVersion,
+    yt_dlp_path: ytDlpPath,
     has_po_token: !!cachedPoToken,
     pip_plugin_installed: pipPlugin,
     pot_provider_running: potProviderRunning,
@@ -500,9 +517,9 @@ app.post("/metadata", requireApiKey, async (req, res) => {
   const { url } = req.body;
   if (!url) return res.status(400).json({ success: false, error: "No URL provided" });
   try {
-    const match = url.match(/spotify\.com\/(track|album|playlist)\/([a-zA-Z0-9]+)/);
-    if (!match) return res.status(400).json({ success: false, error: "Invalid Spotify link" });
-    const type = match[1], id = match[2];
+    const parsed = parseSpotifyUrl(url);
+    if (!parsed) return res.status(400).json({ success: false, error: "Invalid Spotify link" });
+    const type = parsed.type, id = parsed.id;
     await ensureSpotifyToken();
     if (type === "track") {
       const d = (await spotifyApi.getTrack(id)).body;
@@ -518,7 +535,7 @@ app.post("/metadata", requireApiKey, async (req, res) => {
     }
   } catch (error) {
     console.error("[/metadata] error:", error.message);
-    res.status(500).json({ success: false, error: "Failed to fetch metadata" });
+    res.status(500).json({ success: false, error: "Failed: " + error.message });
   }
 });
 
@@ -528,9 +545,9 @@ app.post("/download", requireApiKey, async (req, res) => {
   let artworkPath = null, rawFile = null, taggedFile = null;
   const tempFiles = [];
   try {
-    const match = url.match(/spotify\.com\/(track|album|playlist)\/([a-zA-Z0-9]+)/);
-    if (!match) return res.status(400).json({ success: false, error: "Invalid Spotify link" });
-    const type = match[1], id = match[2];
+    const parsed = parseSpotifyUrl(url);
+    if (!parsed) return res.status(400).json({ success: false, error: "Invalid Spotify link" });
+    const type = parsed.type, id = parsed.id;
     if (type !== "track") return res.status(400).json({ success: false, error: "Only individual tracks supported." });
 
     await ensureSpotifyToken();
@@ -580,7 +597,7 @@ app.post("/download", requireApiKey, async (req, res) => {
   } catch (error) {
     console.error("[/download] error:", error.message);
     cleanup();
-    if (!res.headersSent) res.status(500).json({ success: false, error: "Download failed" });
+    if (!res.headersSent) res.status(500).json({ success: false, error: "Download failed: " + error.message });
   }
   function cleanup() {
     [artworkPath, ...tempFiles].forEach((f) => {
@@ -590,31 +607,52 @@ app.post("/download", requireApiKey, async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, async () => {
-  console.log(`SideCut backend running on port ${PORT}`);
-  console.log(`Node: ${process.version}`);
-  if (!API_KEY) {
-    console.warn(
-      "[SECURITY] API_KEY not set \u2014 /metadata and /download are unauthenticated. " +
-        "Set API_KEY to require an x-api-key header."
-    );
-  }
-  if (!ADMIN_TOKEN) {
-    console.warn(
-      "[SECURITY] ADMIN_TOKEN not set \u2014 /debug, /test-pot and /test-download are disabled."
-    );
-  }
 
-  // Start the PO Token provider server (for pip plugin auto-connect)
-  startPotProviderServer();
+function start() {
+  return app.listen(PORT, async () => {
+    console.log(`SideCut backend running on port ${PORT}`);
+    console.log(`Node: ${process.version}`);
+    if (!API_KEY) {
+      console.warn(
+        "[SECURITY] API_KEY not set \u2014 /metadata and /download are unauthenticated. " +
+          "Set API_KEY to require an x-api-key header."
+      );
+    }
+    if (!ADMIN_TOKEN) {
+      console.warn(
+        "[SECURITY] ADMIN_TOKEN not set \u2014 /debug, /test-pot and /test-download are disabled."
+      );
+    }
 
-  // Pre-generate PO Token at startup so errors are visible in Render logs
-  console.log("=== Pre-generating PO Token at startup ===");
-  const token = await generatePoToken();
-  if (token) {
-    console.log("âœ“âœ“âœ“ PO Token ready at startup âœ“âœ“âœ“");
-  } else {
-    console.log("âš âš âš  PO Token generation FAILED at startup âš âš âš ");
-    console.log("âš  Check the [POT] error messages above");
-  }
-});
+    // Start the PO Token provider server (for pip plugin auto-connect)
+    startPotProviderServer();
+
+    // Pre-generate PO Token at startup so errors are visible in Render logs
+    console.log("=== Pre-generating PO Token at startup ===");
+    const token = await generatePoToken();
+    if (token) {
+      console.log("âœ“âœ“âœ“ PO Token ready at startup âœ“âœ“âœ“");
+    } else {
+      console.log("âš âš âš  PO Token generation FAILED at startup âš âš âš ");
+      console.log("âš  Check the [POT] error messages above");
+    }
+  });
+}
+
+if (require.main === module) {
+  start();
+}
+
+module.exports = {
+  app,
+  start,
+  parseSpotifyUrl,
+  getCookieFile,
+  downloadFile,
+  tagMp3,
+  fetchFn,
+  runYtDlp,
+  ensureSpotifyToken,
+  generatePoToken,
+  startPotProviderServer,
+};

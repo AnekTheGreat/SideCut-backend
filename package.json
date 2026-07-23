@@ -2,8 +2,22 @@
   "name": "sidecut-backend",
   "version": "1.0.0",
   "main": "server.js",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "jest",
+    "test:coverage": "jest --coverage"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "collectCoverageFrom": [
+      "server.js"
+    ],
+    "testPathIgnorePatterns": [
+      "/node_modules/"
+    ]
   },
   "dependencies": {
     "bgutils-js": "^4.0.0",
@@ -16,5 +30,9 @@
     "youtube-dl-exec": "^3.0.1",
     "youtubei.js": "^17.2.0",
     "yt-search": "^2.12.1"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "supertest": "^6.3.4"
   }
 }

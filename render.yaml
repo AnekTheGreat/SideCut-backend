@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: sidecut-backend
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: SPOTIFY_CLIENT_ID
+        sync: false
+      - key: SPOTIFY_CLIENT_SECRET
+        sync: false
+      - key: YOUTUBE_COOKIES
+        sync: false
