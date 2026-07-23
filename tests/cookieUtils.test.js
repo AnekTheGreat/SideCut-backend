@@ -1,7 +1,48 @@
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
-const { normalizeCookies, analyzeCookieFile } = require("../lib/cookieUtils");
+const { normalizeCookies, jsonCookiesToNetscape, analyzeCookieFile } = require("../lib/cookieUtils");
+
+describe("jsonCookiesToNetscape", () => {
+  test("converts a JSON cookie export into Netscape format", () => {
+    const json = JSON.stringify([
+      { domain: ".youtube.com", name: "SID", value: "aaa", path: "/", secure: false, expirationDate: 1819306413.9 },
+      { domain: ".youtube.com", name: "YSC", value: "ccc", path: "/", secure: true, session: true },
+    ]);
+    const out = jsonCookiesToNetscape(json);
+    expect(out.startsWith("# Netscape HTTP Cookie File")).toBe(true);
+    expect(out).toContain(".youtube.com\tTRUE\t/\tFALSE\t1819306413\tSID\taaa");
+    // session cookies get expiry 0
+    expect(out).toContain(".youtube.com\tTRUE\t/\tTRUE\t0\tYSC\tccc");
+  });
+
+  test("supports host-only (no leading dot) domains", () => {
+    const out = jsonCookiesToNetscape(
+      JSON.stringify([{ domain: "youtube.com", name: "X", value: "1", secure: false, session: true }])
+    );
+    expect(out).toContain("youtube.com\tFALSE\t/\tFALSE\t0\tX\t1");
+  });
+
+  test("returns null for non-JSON input", () => {
+    expect(jsonCookiesToNetscape("# Netscape HTTP Cookie File\n")).toBeNull();
+  });
+
+  test("returns null for JSON that isn't a cookie array", () => {
+    expect(jsonCookiesToNetscape('{"foo":"bar"}')).toBeNull();
+    expect(jsonCookiesToNetscape('[{"nope":1}]')).toBeNull();
+  });
+});
+
+describe("normalizeCookies with JSON input", () => {
+  test("detects and converts a JSON export", () => {
+    const json = JSON.stringify([
+      { domain: ".youtube.com", name: "SAPISID", value: "bbb", path: "/", secure: true, expirationDate: 1815513081.1 },
+    ]);
+    const out = normalizeCookies(json);
+    expect(out).toContain("\tSAPISID\tbbb");
+    expect(out).not.toContain("{");
+  });
+});
 
 describe("normalizeCookies", () => {
   test("adds a Netscape header when missing", () => {
