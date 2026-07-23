@@ -14,7 +14,17 @@ try {
   ffmpeg = require("fluent-ffmpeg");
   ffmpegPath = require("ffmpeg-static");
   ffmpeg.setFfmpegPath(ffmpegPath);
-} catch (e) {}
+} catch (e) {
+  console.warn("[INIT] ffmpeg unavailable, MP3 tagging will be skipped:", e.message);
+}
+
+// Surface otherwise-silent async failures instead of letting them vanish
+process.on("unhandledRejection", (reason) => {
+  console.error("[FATAL] Unhandled promise rejection:", reason instanceof Error ? reason.stack : reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[FATAL] Uncaught exception:", err.stack || err.message);
+});
 
 // â”€â”€â”€ PO Token Generator (bgutils-js + JSDOM, NO Chrome needed) â”€â”€â”€
 let bgUtils = null;
@@ -65,7 +75,21 @@ function fetchFn(url, options = {}) {
       (res) => {
         let data = "";
         res.on("data", (c) => (data += c));
-        res.on("end", () => resolve({ ok: res.statusCode >= 200, status: res.statusCode, json: async () => JSON.parse(data), text: async () => data }));
+        res.on("error", reject);
+        res.on("end", () =>
+          resolve({
+            ok: res.statusCode >= 200 && res.statusCode < 300,
+            status: res.statusCode,
+            json: async () => {
+              try {
+                return JSON.parse(data);
+              } catch (e) {
+                throw new Error(`Invalid JSON from ${url} (status ${res.statusCode}): ${data.slice(0, 200)}`);
+              }
+            },
+            text: async () => data,
+          })
+        );
       }
     );
     req.on("error", reject);
@@ -208,12 +232,16 @@ function startPotProviderServer() {
       res.status(204).send();
     });
 
-    potApp.listen(4416, "127.0.0.1", () => {
+    const potServer = potApp.listen(4416, "127.0.0.1", () => {
       potProviderRunning = true;
       console.log("[POT] âœ“ Provider server running on port 4416");
     });
+    potServer.on("error", (e) => {
+      potProviderRunning = false;
+      console.error("[POT] Provider server error:", e.message);
+    });
   } catch (e) {
-    console.log("[POT] Provider server failed to start:", e.message);
+    console.error("[POT] Provider server failed to start:", e.message);
   }
 }
 
@@ -236,19 +264,32 @@ async function ensureSpotifyToken() {
   tokenExpiry = Date.now() + (data.body.expires_in - 60) * 1000;
 }
 
-function downloadFile(url, dest) {
+function downloadFile(url, dest, redirects = 0) {
   return new Promise((resolve, reject) => {
     const file = fs.createWriteStream(dest);
+    const fail = (err) => {
+      file.close();
+      fs.unlink(dest, () => {});
+      reject(err);
+    };
+    file.on("error", fail);
     https.get(url, (res) => {
-      if (res.statusCode === 301 || res.statusCode === 302) {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
         file.close();
         fs.unlink(dest, () => {});
-        downloadFile(res.headers.location, dest).then(resolve).catch(reject);
+        if (redirects >= 5) return reject(new Error(`Too many redirects downloading ${url}`));
+        res.resume();
+        downloadFile(res.headers.location, dest, redirects + 1).then(resolve).catch(reject);
         return;
       }
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        res.resume();
+        return fail(new Error(`Download failed for ${url}: HTTP ${res.statusCode}`));
+      }
+      res.on("error", fail);
       res.pipe(file);
       file.on("finish", () => { file.close(); resolve(dest); });
-    }).on("error", (err) => { file.close(); fs.unlink(dest, () => {}); reject(err); });
+    }).on("error", fail);
   });
 }
 
@@ -496,7 +537,13 @@ app.post("/download", async (req, res) => {
     if (!video) return res.status(404).json({ success: false, error: "No matching audio on YouTube" });
 
     if (artworkUrl) {
-      try { artworkPath = `/tmp/artwork_${id}.jpg`; await downloadFile(artworkUrl, artworkPath); } catch (e) {}
+      try {
+        artworkPath = `/tmp/artwork_${id}.jpg`;
+        await downloadFile(artworkUrl, artworkPath);
+      } catch (e) {
+        console.warn(`[DL] Artwork download failed for ${id}, continuing without embedded art:`, e.message);
+        artworkPath = null;
+      }
     }
 
     rawFile = `/tmp/sidecut_raw_${id}_${Date.now()}.mp3`;
@@ -514,8 +561,12 @@ app.post("/download", async (req, res) => {
 
     taggedFile = `/tmp/sidecut_tagged_${id}_${Date.now()}.mp3`;
     tempFiles.push(taggedFile);
-    try { await tagMp3(rawFile, taggedFile, { title: trackName, artist: artistName, album: albumName }, artworkPath); }
-    catch (e) { fs.copyFileSync(rawFile, taggedFile); }
+    try {
+      await tagMp3(rawFile, taggedFile, { title: trackName, artist: artistName, album: albumName }, artworkPath);
+    } catch (e) {
+      console.warn(`[DL] MP3 tagging failed for ${id}, serving untagged audio:`, e.message);
+      fs.copyFileSync(rawFile, taggedFile);
+    }
 
     const safeFileName = `${artistName} - ${trackName}`.replace(/[^\w\s\-]/g, "_").trim();
     res.setHeader("Content-Type", "audio/mpeg");
