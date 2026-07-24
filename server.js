@@ -419,18 +419,30 @@ function getCookieFile() {
   return null;
 }
 
-async function tryDownload(videoUrl, outputFile) {
+async function tryDownload(videoUrl, outputFile, controller = null) {
   const cookieFile = getCookieFile();
   const poToken = await generatePoToken();
   const results = [];
+  
+  // Helper to check cancellation
+  const isCancelled = () => controller?.cancelled;
 
   if (!poToken) {
     console.log("[DL] âš  No PO Token available - downloads will likely fail");
   }
+  
+  // Helper to run yt-dlp with cancellation check
+  async function runYtDlpWithCheck(args) {
+    if (isCancelled()) return { ok: false, stderr: "cancelled", timedOut: false };
+    return await runYtDlp(args, { ytDlpPath });
+  }
 
   // Strategy 1: PO Token only (no cookies) â€” most reliable, bypasses bot detection
+  // STOP on first clear failure (bot detection = immediate stop)
   if (poToken) {
     for (const client of [null, "android_vr", "web", "mweb"]) {
+      if (isCancelled()) return { ok: false, results, cancelled: true };
+      
       const extractorArgs = client
         ? `youtube:player_client=${client};po_token=gvs:${poToken}`
         : `youtube:po_token=gvs:${poToken}`;
@@ -438,7 +450,10 @@ async function tryDownload(videoUrl, outputFile) {
 
       const label = `${client || "default"}+pot`;
       console.log(`[DL] Trying ${label}...`);
-      const result = await runYtDlp(args, { ytDlpPath });
+      const result = await runYtDlpWithCheck(args);
+      
+      if (isCancelled()) return { ok: false, results, cancelled: true };
+      
       if (result.ok && isValidDownload(outputFile)) {
         console.log(`[DL] âœ“ ${label} succeeded: ${fs.statSync(outputFile).size} bytes`);
         return { ok: true, method: label, results };
@@ -447,12 +462,20 @@ async function tryDownload(videoUrl, outputFile) {
       results.push({ method: label, error: errLine });
       console.log(`[DL] âœ— ${label}: ${errLine}`);
       safeUnlink(outputFile);
+      
+      // If it's a bot detection error, stop trying other strategies (they'll all fail)
+      if (errLine && (errLine.includes("bot") || errLine.includes("detected") || errLine.includes("403") || errLine.includes("captcha"))) {
+        console.log(`[DL] Bot detection detected - stopping retries`);
+        return { ok: false, results, stopped: "bot_detection" };
+      }
     }
   }
 
   // Strategy 2: Cookies + PO Token
-  if (cookieFile && poToken) {
+  if (cookieFile && poToken && !isCancelled()) {
     for (const client of ["web", "mweb", "android"]) {
+      if (isCancelled()) return { ok: false, results, cancelled: true };
+      
       const args = buildYtDlpArgs({
         outputFile,
         extractorArgs: `youtube:player_client=${client};po_token=gvs:${poToken}`,
@@ -461,32 +484,50 @@ async function tryDownload(videoUrl, outputFile) {
 
       const label = `${client}+cookies+pot`;
       console.log(`[DL] Trying ${label}...`);
-      const result = await runYtDlp(args, { ytDlpPath });
+      const result = await runYtDlpWithCheck(args);
+      
+      if (isCancelled()) return { ok: false, results, cancelled: true };
+      
       if (result.ok && isValidDownload(outputFile)) {
         console.log(`[DL] âœ“ ${label} succeeded: ${fs.statSync(outputFile).size} bytes`);
         return { ok: true, method: label, results };
       }
-      results.push({ method: label, error: extractErrorLine(result.stderr) });
+      const errLine = extractErrorLine(result.stderr);
+      results.push({ method: label, error: errLine });
+      console.log(`[DL] âœ— ${label}: ${errLine}`);
       safeUnlink(outputFile);
+      
+      // If bot detection, stop
+      if (errLine && (errLine.includes("bot") || errLine.includes("detected") || errLine.includes("403") || errLine.includes("captcha"))) {
+        console.log(`[DL] Bot detection detected - stopping retries`);
+        return { ok: false, results, stopped: "bot_detection" };
+      }
     }
   }
 
-  // Strategy 3: Cookies only (last resort)
-  if (cookieFile) {
+  // Strategy 3: Cookies only (last resort) - only if not already stopped
+  if (cookieFile && !isCancelled()) {
     for (const client of ["web", "android_vr"]) {
+      if (isCancelled()) return { ok: false, results, cancelled: true };
+      
       const args = buildYtDlpArgs({
         outputFile,
         extractorArgs: `youtube:player_client=${client}`,
         cookieFile, ffmpegPath, videoUrl,
       });
       const label = `${client}+cookies`;
-      const result = await runYtDlp(args, { ytDlpPath });
+      const result = await runYtDlpWithCheck(args);
+      
+      if (isCancelled()) return { ok: false, results, cancelled: true };
+      
       if (result.ok && isValidDownload(outputFile))
         return { ok: true, method: label, results };
       results.push({ method: label, error: "failed" });
       safeUnlink(outputFile);
     }
   }
+  
+  if (isCancelled()) return { ok: false, results, cancelled: true };
 
   return { ok: false, results };
 }
@@ -790,6 +831,7 @@ app.post("/search-metadata", requireApiKey, async (req, res) => {
 
 // Download progress tracking
 const downloadProgress = {};
+const downloadControllers = {}; // AbortController-like for cancellation
 
 app.get("/download-status/:id", (req, res) => {
   const status = downloadProgress[req.params.id];
@@ -817,6 +859,22 @@ app.get("/download-status/:id", (req, res) => {
     estimatedRemainingSeconds: estimatedRemaining ? Math.round(estimatedRemaining) : null,
     error: status.error,
   });
+});
+
+// Cancel a download
+app.post("/download-cancel/:id", (req, res) => {
+  const id = req.params.id;
+  if (downloadControllers[id]) {
+    downloadControllers[id].cancelled = true;
+    console.log(`[DL] Download ${id} cancellation requested`);
+    res.json({ success: true, message: "Download cancellation requested" });
+  } else if (downloadProgress[id]) {
+    downloadProgress[id].stage = "cancelled";
+    downloadProgress[id].error = "Cancelled by user";
+    res.json({ success: true, message: "Download marked as cancelled" });
+  } else {
+    res.status(404).json({ error: "Download not found" });
+  }
 });
 
 app.post("/download", requireApiKey, async (req, res) => {
@@ -863,6 +921,7 @@ app.post("/download", requireApiKey, async (req, res) => {
 
     console.log(`[/download] Searching YouTube for: ${artistName} ${trackName}`);
     downloadProgress[id] = { startTime: Date.now(), trackName: `${artistName} - ${trackName}`, stage: "searching", progress: 0 };
+    downloadControllers[id] = { cancelled: false };
     
     const searchResults = await ytSearch(`${artistName} ${trackName}`);
     console.log(`[/download] YouTube search complete, found ${searchResults.videos?.length || 0} videos`);
@@ -870,9 +929,18 @@ app.post("/download", requireApiKey, async (req, res) => {
     const video = searchResults.videos[0];
     if (!video) {
       delete downloadProgress[id];
+      delete downloadControllers[id];
       return res.status(404).json({ success: false, error: "No matching audio on YouTube" });
     }
     console.log(`[/download] Found video: ${video.title}`);
+
+    // Check for cancellation
+    if (downloadControllers[id]?.cancelled) {
+      console.log(`[/download] Download cancelled before starting`);
+      delete downloadProgress[id];
+      delete downloadControllers[id];
+      return res.status(499).json({ success: false, error: "Download cancelled" });
+    }
 
     // Estimate file size based on duration (audio ~128kbps = ~16KB/s)
     const estimatedDurationSec = video.duration?.seconds || track.duration_ms / 1000 || 180;
@@ -889,8 +957,18 @@ app.post("/download", requireApiKey, async (req, res) => {
     tempFiles.push(rawFile);
     console.log(`[/download] Starting YouTube download...`);
 
-    const { ok, method, results } = await tryDownload(video.url, rawFile);
-    console.log(`[/download] YouTube download complete, ok=${ok}`);
+    const controller = downloadControllers[id];
+    const { ok, method, results } = await tryDownload(video.url, rawFile, controller);
+    console.log(`[/download] YouTube download complete, ok=${ok}, cancelled=${controller?.cancelled}`);
+    
+    // Check if cancelled during download
+    if (controller?.cancelled) {
+      console.log(`[/download] Download was cancelled`);
+      downloadProgress[id].stage = "cancelled";
+      delete downloadProgress[id];
+      delete downloadControllers[id];
+      return res.status(499).json({ success: false, error: "Download cancelled" });
+    }
     
     if (!ok) {
       console.log(`[/download] Download failed: ${JSON.stringify(results)}`);
@@ -905,6 +983,7 @@ app.post("/download", requireApiKey, async (req, res) => {
         hasCookies: !!getCookieFile(),
       };
       delete downloadProgress[id];
+      delete downloadControllers[id];
       return res.status(502).json(errorResponse);
     }
     
@@ -930,21 +1009,25 @@ app.post("/download", requireApiKey, async (req, res) => {
     fileStream.on("end", () => {
       cleanup();
       delete downloadProgress[id];
+      delete downloadControllers[id];
     });
     fileStream.on("error", () => {
       if (!res.headersSent) res.status(500).json({ success: false, error: "Stream error" });
       cleanup();
       delete downloadProgress[id];
+      delete downloadControllers[id];
     });
     req.on("close", () => {
       cleanup();
       delete downloadProgress[id];
+      delete downloadControllers[id];
     });
   } catch (error) {
     console.error("[/download] error:", error.message);
     downloadProgress[id] = { stage: "failed", error: error.message };
     cleanup();
     delete downloadProgress[id];
+    delete downloadControllers[id];
     if (!res.headersSent) res.status(500).json({ success: false, error: "Download failed: " + error.message });
   }
   function cleanup() {
