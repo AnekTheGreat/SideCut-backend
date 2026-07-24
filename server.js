@@ -15,6 +15,101 @@ const { runYtDlp, buildYtDlpArgs, extractErrorLine } = require("./lib/ytdlp");
 const { normalizeCookies, analyzeCookieFile } = require("./lib/cookieUtils");
 const NodeID3 = require("node-id3");
 
+// â”€â”€â”€ Auto Cookie Update System â”€â”€â”€
+let cookieAutoUpdateInterval = null;
+let lastCookieUpdate = null;
+let cookieUpdateCount = 0;
+
+// Cookie update handlers (extensible for different providers)
+const cookieProviders = {
+  // Placeholder for cookie provider integration
+  // Add your cookie provider API here
+};
+
+// Check if cookies need refresh (expiry-based or provider-based)
+async function checkAndRefreshCookies() {
+  const cookieFile = getCookieFile();
+  const analysis = analyzeCookieFile(cookieFile);
+  
+  if (!analysis.configured) {
+    console.log("[CookieAutoUpdate] No cookies configured, skipping refresh check");
+    return { refreshed: false, reason: "no_cookies" };
+  }
+  
+  // Check if using a cookie provider that auto-refreshes
+  if (process.env.COOKIE_PROVIDER_URL) {
+    console.log("[CookieAutoUpdate] Refreshing cookies from provider...");
+    try {
+      const newCookies = await fetchFromCookieProvider();
+      if (newCookies) {
+        fs.writeFileSync("/tmp/yt_cookies.txt", normalizeCookies(newCookies));
+        cookieFilePath = "/tmp/yt_cookies.txt";
+        lastCookieUpdate = Date.now();
+        cookieUpdateCount++;
+        console.log(`[CookieAutoUpdate] ✅ Cookies refreshed (count: ${cookieUpdateCount})`);
+        return { refreshed: true, method: "provider" };
+      }
+    } catch (e) {
+      console.log("[CookieAutoUpdate] ❌ Provider fetch failed:", e.message);
+    }
+  }
+  
+  // Check cookie age (warn if old)
+  if (analysis.isAuthenticated) {
+    console.log("[CookieAutoUpdate] Cookies appear valid, no refresh needed");
+    return { refreshed: false, reason: "valid" };
+  }
+  
+  return { refreshed: false, reason: "invalid" };
+}
+
+// Fetch cookies from external provider
+async function fetchFromCookieProvider() {
+  if (!process.env.COOKIE_PROVIDER_URL) return null;
+  
+  try {
+    const response = await fetch(process.env.COOKIE_PROVIDER_URL, {
+      headers: {
+        "Authorization": `Bearer ${process.env.COOKIE_PROVIDER_KEY || ""}`,
+        "Content-Type": "application/json"
+      }
+    });
+    
+    if (!response.ok) {
+      throw new Error(`Provider returned ${response.status}`);
+    }
+    
+    const data = await response.json();
+    return data.cookies || data.cookie || data;
+  } catch (e) {
+    console.log("[CookieAutoUpdate] Provider fetch error:", e.message);
+    return null;
+  }
+}
+
+// Start the auto cookie update scheduler
+function startCookieAutoUpdate(intervalMs = 30 * 60 * 1000) { // Default: 30 minutes
+  if (cookieAutoUpdateInterval) {
+    clearInterval(cookieAutoUpdateInterval);
+  }
+  
+  // Initial check
+  checkAndRefreshCookies();
+  
+  // Schedule periodic checks
+  cookieAutoUpdateInterval = setInterval(checkAndRefreshCookies, intervalMs);
+  console.log(`[CookieAutoUpdate] Started with ${intervalMs / 60000}min interval`);
+}
+
+// Stop the auto cookie update scheduler
+function stopCookieAutoUpdate() {
+  if (cookieAutoUpdateInterval) {
+    clearInterval(cookieAutoUpdateInterval);
+    cookieAutoUpdateInterval = null;
+    console.log("[CookieAutoUpdate] Stopped");
+  }
+}
+
 let ffmpeg = null, ffmpegPath = null;
 try {
   ffmpeg = require("fluent-ffmpeg");
@@ -255,7 +350,12 @@ function safeEqual(a, b) {
 // If API_KEY is unset the endpoints stay open (backward compatible) but a
 // warning is logged at startup so the operator is aware.
 function requireApiKey(req, res, next) {
+  // If API_KEY is not set, skip authentication entirely
   if (!API_KEY) return next();
+  
+  // If API_KEY_REQUIRED is set to "false", skip authentication
+  if (process.env.API_KEY_REQUIRED === "false") return next();
+  
   const provided =
     req.get("x-api-key") ||
     (req.get("authorization") || "").replace(/^Bearer\s+/i, "");
@@ -483,13 +583,68 @@ function tagMp3(inputFile, outputFile, metadata, artworkPath) {
 app.get("/", (req, res) => res.send("SideCut backend is online!"));
 
 app.get("/health", (req, res) => {
+  const cookieAnalysis = analyzeCookieFile(getCookieFile());
   res.json({
     status: "ok",
     spotify: !!process.env.SPOTIFY_CLIENT_ID,
     cookies: !!getCookieFile(),
+    cookie_valid: cookieAnalysis.isAuthenticated,
+    cookie_age: lastCookieUpdate ? Date.now() - lastCookieUpdate : null,
+    cookie_updates: cookieUpdateCount,
+    proxy: !!process.env.YOUTUBE_PROXY,
     po_token: !!cachedPoToken,
     provider_running: potProviderRunning,
   });
+});
+
+// Admin endpoint: Update cookies manually
+app.post("/admin/cookies/update", requireAdmin, async (req, res) => {
+  const { cookies } = req.body;
+  if (!cookies) {
+    return res.status(400).json({ success: false, error: "No cookies provided" });
+  }
+  
+  try {
+    fs.writeFileSync("/tmp/yt_cookies.txt", normalizeCookies(cookies));
+    cookieFilePath = "/tmp/yt_cookies.txt";
+    lastCookieUpdate = Date.now();
+    cookieUpdateCount++;
+    
+    const analysis = analyzeCookieFile(cookieFilePath);
+    res.json({ 
+      success: true, 
+      message: "Cookies updated successfully",
+      analysis 
+    });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+// Admin endpoint: Get cookie status
+app.get("/admin/cookies/status", requireAdmin, async (req, res) => {
+  const cookieFile = getCookieFile();
+  const analysis = analyzeCookieFile(cookieFile);
+  
+  res.json({
+    configured: analysis.configured,
+    valid: analysis.isAuthenticated,
+    auth_cookies: analysis.authCookiesPresent,
+    last_update: lastCookieUpdate ? new Date(lastCookieUpdate).toISOString() : null,
+    update_count: cookieUpdateCount,
+    auto_update_enabled: !!cookieAutoUpdateInterval,
+    provider_configured: !!process.env.COOKIE_PROVIDER_URL,
+  });
+});
+
+// Admin endpoint: Force cookie refresh
+app.post("/admin/cookies/refresh", requireAdmin, async (req, res) => {
+  try {
+    const result = await checkAndRefreshCookies();
+    res.json({ success: true, ...result });
+  } catch (e) {
+    res.status(500).json({ success: false, error: e.message });
+  }
 });
 
 app.get("/debug", requireAdmin, async (req, res) => {
@@ -824,6 +979,12 @@ function start() {
 
     // Start the PO Token provider server (for pip plugin auto-connect)
     startPotProviderServer();
+
+    // Start auto cookie update if configured
+    if (process.env.COOKIE_PROVIDER_URL || process.env.YOUTUBE_COOKIES) {
+      const intervalMs = parseInt(process.env.COOKIE_UPDATE_INTERVAL || "1800000"); // Default 30 min
+      startCookieAutoUpdate(intervalMs);
+    }
 
     // Pre-generate PO Token at startup so errors are visible in Render logs
     console.log("=== Pre-generating PO Token at startup ===");
