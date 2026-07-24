@@ -799,13 +799,18 @@ app.post("/download", requireApiKey, async (req, res) => {
     const { type, id } = parsed;
     if (type !== "track") return res.status(400).json({ success: false, error: "Only individual tracks supported." });
 
+    console.log(`[/download] Starting download for track ID: ${id}`);
+    
     await ensureSpotifyToken();
+    console.log(`[/download] Spotify token ready`);
+    
     const track = (await spotifyApi.getTrack(id)).body;
     const artistName = joinArtists(track.artists);
     const trackName = track.name;
     const albumName = track.album.name;
     const artworkUrl = firstImageUrl(track.album.images);
     const releaseYear = track.album.release_date ? track.album.release_date.split("-")[0] : "";
+    console.log(`[/download] Track: ${artistName} - ${trackName}`);
     
     // Extract genre from album (if available) - Spotify doesn't always provide this
     const genre = track.genres?.[0] || "Music";
@@ -825,19 +830,27 @@ app.post("/download", requireApiKey, async (req, res) => {
       duration: track.duration_ms,
     };
 
+    console.log(`[/download] Searching YouTube for: ${artistName} ${trackName}`);
     const searchResults = await ytSearch(`${artistName} ${trackName}`);
+    console.log(`[/download] YouTube search complete, found ${searchResults.videos?.length || 0} videos`);
+    
     const video = searchResults.videos[0];
     if (!video) return res.status(404).json({ success: false, error: "No matching audio on YouTube" });
+    console.log(`[/download] Found video: ${video.title}`);
 
     if (artworkUrl) {
-      try { artworkPath = `/tmp/artwork_${id}.jpg`; await downloadFile(artworkUrl, artworkPath); } catch (e) {}
+      try { artworkPath = `/tmp/artwork_${id}.jpg`; await downloadFile(artworkUrl, artworkPath); console.log(`[/download] Artwork downloaded`); } catch (e) { console.log(`[/download] Artwork download failed: ${e.message}`); }
     }
 
     rawFile = `/tmp/sidecut_raw_${id}_${Date.now()}.mp3`;
     tempFiles.push(rawFile);
+    console.log(`[/download] Starting YouTube download...`);
 
     const { ok, method, results } = await tryDownload(video.url, rawFile);
+    console.log(`[/download] YouTube download complete, ok=${ok}`);
+    
     if (!ok) {
+      console.log(`[/download] Download failed: ${JSON.stringify(results)}`);
       return res.status(502).json({
         success: false,
         error: (results || []).map((r) => `[${r.method}]: ${r.error}`).join(" | "),
@@ -847,6 +860,7 @@ app.post("/download", requireApiKey, async (req, res) => {
         hasCookies: !!getCookieFile(),
       });
     }
+    console.log(`[/download] Processing tags...`);
 
     taggedFile = `/tmp/sidecut_tagged_${id}_${Date.now()}.mp3`;
     tempFiles.push(taggedFile);
