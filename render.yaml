@@ -10,19 +10,29 @@ services:
         sync: false
       - key: SPOTIFY_CLIENT_SECRET
         sync: false
-      - key: YOUTUBE_COOKIES
-        sync: false
-        comment: "Browser cookies for YouTube (optional, use YOUTUBE_PROXY as alternative)"
       - key: YOUTUBE_PROXY
         sync: false
-        comment: "Residential proxy URL (e.g., http://user:pass@proxy.example.com:8080) - recommended over cookies"
+        comment: "Residential proxy URL (recommended over cookies) - format: http://user:pass@proxy.example.com:8080"
+      - key: YOUTUBE_COOKIES
+        sync: false
+        comment: "Browser cookies for YouTube (optional, auto-refreshes if COOKIE_PROVIDER_URL is set)"
       - key: API_KEY
         sync: false
         comment: "API key for authenticating requests from the frontend"
       - key: ADMIN_TOKEN
         sync: false
-        comment: "Admin token for debug endpoints"
+        comment: "Admin token for debug/admin endpoints"
       - key: DEBUG_YTDL
         sync: false
         value: "false"
         comment: "Set to 'true' for verbose yt-dlp logging"
+      - key: COOKIE_PROVIDER_URL
+        sync: false
+        comment: "URL to fetch fresh cookies from (auto-updates cookies periodically)"
+      - key: COOKIE_PROVIDER_KEY
+        sync: false
+        comment: "API key for the cookie provider"
+      - key: COOKIE_UPDATE_INTERVAL
+        sync: false
+        value: "1800000"
+        comment: "Cookie refresh interval in milliseconds (default: 30 minutes = 1800000)"
