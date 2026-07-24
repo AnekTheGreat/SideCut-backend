@@ -12,5 +12,17 @@ services:
         sync: false
       - key: YOUTUBE_COOKIES
         sync: false
+        comment: "Browser cookies for YouTube (optional, use YOUTUBE_PROXY as alternative)"
       - key: YOUTUBE_PROXY
         sync: false
+        comment: "Residential proxy URL (e.g., http://user:pass@proxy.example.com:8080) - recommended over cookies"
+      - key: API_KEY
+        sync: false
+        comment: "API key for authenticating requests from the frontend"
+      - key: ADMIN_TOKEN
+        sync: false
+        comment: "Admin token for debug endpoints"
+      - key: DEBUG_YTDL
+        sync: false
+        value: "false"
+        comment: "Set to 'true' for verbose yt-dlp logging"
