@@ -13,6 +13,7 @@ const { safeUnlink, isValidDownload, downloadFile } = require("./lib/fileUtils")
 const { parseSpotifyUrl, joinArtists, firstImageUrl, buildSearchQuery, mapTrackToMetadata } = require("./lib/spotifyUtils");
 const { runYtDlp, buildYtDlpArgs, extractErrorLine } = require("./lib/ytdlp");
 const { normalizeCookies, analyzeCookieFile } = require("./lib/cookieUtils");
+const NodeID3 = require("node-id3");
 
 let ffmpeg = null, ffmpegPath = null;
 try {
@@ -384,15 +385,97 @@ async function tryDownload(videoUrl, outputFile) {
   return { ok: false, results };
 }
 
+/**
+ * Embed comprehensive ID3 metadata into an MP3 file.
+ * Supports: title, artist, album, track number, year, genre, disc number, ISRC, comment, artwork
+ */
 function tagMp3(inputFile, outputFile, metadata, artworkPath) {
   return new Promise((resolve, reject) => {
-    if (!ffmpeg) { fs.copyFileSync(inputFile, outputFile); resolve(); return; }
-    let cmd = ffmpeg().input(inputFile);
-    if (artworkPath && fs.existsSync(artworkPath)) cmd = cmd.input(artworkPath);
-    const opts = ["-metadata", `title=${metadata.title}`, "-metadata", `artist=${metadata.artist}`, "-metadata", `album=${metadata.album}`];
-    if (artworkPath && fs.existsSync(artworkPath))
-      opts.push("-map", "0:a", "-map", "1:v", "-c:v", "mjpeg", "-disposition:v:0", "attached_pic");
-    cmd.toFormat("mp3").audioBitrate(192).outputOptions(opts).save(outputFile).on("end", resolve).on("error", reject);
+    // First, use ffmpeg to embed basic metadata and artwork
+    if (ffmpeg) {
+      let cmd = ffmpeg().input(inputFile);
+      if (artworkPath && fs.existsSync(artworkPath)) cmd = cmd.input(artworkPath);
+      
+      const opts = [
+        "-metadata", `title=${metadata.title || ""}`,
+        "-metadata", `artist=${metadata.artist || ""}`,
+        "-metadata", `album=${metadata.album || ""}`,
+        "-metadata", `track=${metadata.trackNumber || ""}`,
+        "-metadata", `year=${metadata.year || ""}`,
+        "-metadata", `genre=${metadata.genre || ""}`,
+        "-metadata", `disc=${metadata.discNumber || ""}`,
+        "-metadata", `comment=${metadata.comment || `Downloaded from Spotify via SideCut | ${metadata.spotifyId || ""}`}`,
+      ];
+      
+      if (artworkPath && fs.existsSync(artworkPath)) {
+        opts.push("-map", "0:a", "-map", "1:v", "-c:v", "mjpeg", "-disposition:v:0", "attached_pic");
+      }
+      
+      cmd.toFormat("mp3").audioBitrate(320).outputOptions(opts).save(outputFile)
+        .on("end", () => {
+          // Now enhance with node-id3 for additional tags
+          try {
+            const tags = {
+              title: metadata.title,
+              artist: metadata.artist,
+              album: metadata.album,
+              trackNumber: metadata.trackNumber ? String(metadata.trackNumber) : undefined,
+              year: metadata.year,
+              genre: metadata.genre,
+              discNumber: metadata.discNumber ? String(metadata.discNumber) : undefined,
+              comment: {
+                language: "eng",
+                text: metadata.comment || `Downloaded from Spotify via SideCut | ${metadata.spotifyId || ""}`
+              },
+              image: artworkPath && fs.existsSync(artworkPath) ? artworkPath : undefined,
+              imageMimeType: "image/jpeg",
+            };
+            
+            // Add ISRC if available (node-id3 specific)
+            if (metadata.isrc) {
+              tags.userDefinedFrame = {
+                "TXXX:ISRC": metadata.isrc
+              };
+            }
+            
+            NodeID3.update(tags, outputFile, (err) => {
+              if (err) console.log("[TAG] node-id3 warning:", err.message);
+              resolve();
+            });
+          } catch (e) {
+            console.log("[TAG] Enhancement failed:", e.message);
+            resolve();
+          }
+        })
+        .on("error", (e) => {
+          console.log("[TAG] ffmpeg failed, using copy:", e.message);
+          try { fs.copyFileSync(inputFile, outputFile); } catch (copyErr) {}
+          resolve();
+        });
+    } else {
+      // Fallback: just copy and use node-id3
+      try {
+        fs.copyFileSync(inputFile, outputFile);
+        const tags = {
+          title: metadata.title,
+          artist: metadata.artist,
+          album: metadata.album,
+          trackNumber: metadata.trackNumber ? String(metadata.trackNumber) : undefined,
+          year: metadata.year,
+          genre: metadata.genre,
+          comment: {
+            language: "eng",
+            text: `Downloaded from Spotify via SideCut | ${metadata.spotifyId || ""}`
+          },
+          image: artworkPath && fs.existsSync(artworkPath) ? artworkPath : undefined,
+          imageMimeType: "image/jpeg",
+        };
+        NodeID3.update(tags, outputFile);
+      } catch (e) {
+        console.log("[TAG] Fallback failed:", e.message);
+      }
+      resolve();
+    }
   });
 }
 
@@ -561,6 +644,25 @@ app.post("/download", requireApiKey, async (req, res) => {
     const trackName = track.name;
     const albumName = track.album.name;
     const artworkUrl = firstImageUrl(track.album.images);
+    const releaseYear = track.album.release_date ? track.album.release_date.split("-")[0] : "";
+    
+    // Extract genre from album (if available) - Spotify doesn't always provide this
+    const genre = track.genres?.[0] || "Music";
+    
+    // Build comprehensive metadata object
+    const metadata = {
+      title: trackName,
+      artist: artistName,
+      album: albumName,
+      trackNumber: track.track_number,
+      discNumber: track.disc_number,
+      year: releaseYear,
+      genre: genre,
+      isrc: track.external_ids?.isrc || "",
+      spotifyId: track.id,
+      comment: `Source: Spotify | ${track.external_urls?.spotify || ""}`,
+      duration: track.duration_ms,
+    };
 
     const searchResults = await ytSearch(`${artistName} ${trackName}`);
     const video = searchResults.videos[0];
@@ -580,12 +682,14 @@ app.post("/download", requireApiKey, async (req, res) => {
         error: (results || []).map((r) => `[${r.method}]: ${r.error}`).join(" | "),
         video: { title: video.title, url: video.url },
         hasPoToken: !!cachedPoToken,
+        hasProxy: !!process.env.YOUTUBE_PROXY,
+        hasCookies: !!getCookieFile(),
       });
     }
 
     taggedFile = `/tmp/sidecut_tagged_${id}_${Date.now()}.mp3`;
     tempFiles.push(taggedFile);
-    try { await tagMp3(rawFile, taggedFile, { title: trackName, artist: artistName, album: albumName }, artworkPath); }
+    try { await tagMp3(rawFile, taggedFile, metadata, artworkPath); }
     catch (e) { fs.copyFileSync(rawFile, taggedFile); }
 
     const safeFileName = `${artistName} - ${trackName}`.replace(/[^\w\s\-]/g, "_").trim();
@@ -607,6 +711,97 @@ app.post("/download", requireApiKey, async (req, res) => {
   function cleanup() {
     [artworkPath, ...tempFiles].forEach((f) => safeUnlink(f));
   }
+});
+
+// Batch download endpoint - downloads a track and returns base64 encoded MP3
+// Useful for playlist downloads where client handles individual files
+app.post("/download-batch", requireApiKey, async (req, res) => {
+  const { tracks } = req.body;
+  if (!Array.isArray(tracks) || tracks.length === 0) {
+    return res.status(400).json({ success: false, error: "No tracks provided" });
+  }
+  if (tracks.length > 50) {
+    return res.status(400).json({ success: false, error: "Max 50 tracks per batch" });
+  }
+
+  const results = [];
+  for (const trackInfo of tracks) {
+    const { spotifyUrl, title, artist, album, artwork, trackNumber, spotifyId, releaseDate } = trackInfo;
+    let artworkPath = null, rawFile = null, taggedFile = null;
+    const tempFiles = [];
+    
+    try {
+      // Search YouTube
+      const searchQuery = `${artist || ""} ${title || ""}`.trim();
+      if (!searchQuery) {
+        results.push({ spotifyId, success: false, error: "No search query" });
+        continue;
+      }
+      
+      const searchResults = await ytSearch(searchQuery);
+      const video = searchResults.videos?.[0];
+      if (!video) {
+        results.push({ spotifyId, success: false, error: "No YouTube match found" });
+        continue;
+      }
+
+      // Download artwork if available
+      if (artwork) {
+        try {
+          artworkPath = `/tmp/artwork_${spotifyId || Date.now()}.jpg`;
+          await downloadFile(artwork, artworkPath);
+          tempFiles.push(artworkPath);
+        } catch (e) { /* skip artwork */ }
+      }
+
+      // Build metadata
+      const metadata = {
+        title: title || "Unknown",
+        artist: artist || "Unknown Artist",
+        album: album || "Unknown Album",
+        trackNumber: trackNumber || undefined,
+        year: releaseDate ? releaseDate.split("-")[0] : undefined,
+        spotifyId: spotifyId || "",
+        comment: `Source: Spotify | ${spotifyUrl || ""}`,
+      };
+
+      // Download audio
+      rawFile = `/tmp/sidecut_raw_${spotifyId || Date.now()}_${Date.now()}.mp3`;
+      tempFiles.push(rawFile);
+      
+      const downloadResult = await tryDownload(video.url, rawFile);
+      if (!downloadResult.ok) {
+        const errorMsg = downloadResult.results?.map((r) => r.error).join(", ") || "Download failed";
+        results.push({ spotifyId, success: false, error: errorMsg, video: video.title });
+        tempFiles.forEach(f => safeUnlink(f));
+        continue;
+      }
+
+      // Tag and return
+      taggedFile = `/tmp/sidecut_tagged_${spotifyId || Date.now()}_${Date.now()}.mp3`;
+      tempFiles.push(taggedFile);
+      
+      try { await tagMp3(rawFile, taggedFile, metadata, artworkPath); }
+      catch (e) { fs.copyFileSync(rawFile, taggedFile); }
+
+      const fileBuffer = fs.readFileSync(taggedFile);
+      results.push({
+        spotifyId,
+        success: true,
+        filename: `${(artist || "Unknown").replace(/[^\w\s\-]/g, "_")} - ${(title || "Unknown").replace(/[^\w\s\-]/g, "_")}.mp3`,
+        data: fileBuffer.toString("base64"),
+        method: downloadResult.method,
+      });
+      
+    } catch (error) {
+      console.error(`[/download-batch] Track ${spotifyId} error:`, error.message);
+      results.push({ spotifyId, success: false, error: error.message });
+    } finally {
+      tempFiles.forEach(f => safeUnlink(f));
+    }
+  }
+
+  res.json({ success: true, results });
 });
 
 const PORT = process.env.PORT || 3000;
