@@ -350,7 +350,12 @@ function safeEqual(a, b) {
 // If API_KEY is unset the endpoints stay open (backward compatible) but a
 // warning is logged at startup so the operator is aware.
 function requireApiKey(req, res, next) {
+  // If API_KEY is not set, skip authentication entirely
   if (!API_KEY) return next();
+  
+  // If API_KEY_REQUIRED is set to "false", skip authentication
+  if (process.env.API_KEY_REQUIRED === "false") return next();
+  
   const provided =
     req.get("x-api-key") ||
     (req.get("authorization") || "").replace(/^Bearer\s+/i, "");
