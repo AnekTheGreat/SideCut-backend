@@ -113,7 +113,13 @@ function stopCookieAutoUpdate() {
 let ffmpeg = null, ffmpegPath = null;
 try {
   ffmpeg = require("fluent-ffmpeg");
-  ffmpegPath = require("ffmpeg-static");
+  // Try system ffmpeg first, then bundled ffmpeg-static
+  const systemFfmpeg = "/usr/bin/ffmpeg";
+  if (fs.existsSync(systemFfmpeg)) {
+    ffmpegPath = systemFfmpeg;
+  } else {
+    ffmpegPath = require("ffmpeg-static");
+  }
   ffmpeg.setFfmpegPath(ffmpegPath);
 } catch (e) {}
 

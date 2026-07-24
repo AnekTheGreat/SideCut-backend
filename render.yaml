@@ -3,7 +3,7 @@ services:
     name: sidecut-backend
     runtime: node
     plan: free
-    buildCommand: npm install
+    buildCommand: apt-get update && apt-get install -y ffmpeg && npm install --ignore-scripts && npm rebuild 2>/dev/null || npm install; pip3 install -U yt-dlp bgutil-ytdlp-pot-provider 2>/dev/null || true
     startCommand: npm start
     envVars:
       - key: SPOTIFY_CLIENT_ID
