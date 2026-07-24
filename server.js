@@ -788,6 +788,37 @@ app.post("/search-metadata", requireApiKey, async (req, res) => {
   }
 });
 
+// Download progress tracking
+const downloadProgress = {};
+
+app.get("/download-status/:id", (req, res) => {
+  const status = downloadProgress[req.params.id];
+  if (!status) return res.status(404).json({ error: "Download not found" });
+  
+  const elapsed = (Date.now() - status.startTime) / 1000;
+  let estimatedRemaining = null;
+  
+  if (status.totalBytes && status.downloadedBytes) {
+    const progress = status.downloadedBytes / status.totalBytes;
+    const speed = status.downloadedBytes / elapsed;
+    if (speed > 0) {
+      const remainingBytes = status.totalBytes - status.downloadedBytes;
+      estimatedRemaining = remainingBytes / speed;
+    }
+    status.progress = Math.round(progress * 100);
+  }
+  
+  res.json({
+    trackId: req.params.id,
+    trackName: status.trackName,
+    stage: status.stage,
+    progress: status.progress || 0,
+    elapsedSeconds: Math.round(elapsed),
+    estimatedRemainingSeconds: estimatedRemaining ? Math.round(estimatedRemaining) : null,
+    error: status.error,
+  });
+});
+
 app.post("/download", requireApiKey, async (req, res) => {
   const { url } = req.body;
   if (!url) return res.status(400).json({ success: false, error: "No URL provided" });
@@ -831,12 +862,24 @@ app.post("/download", requireApiKey, async (req, res) => {
     };
 
     console.log(`[/download] Searching YouTube for: ${artistName} ${trackName}`);
+    downloadProgress[id] = { startTime: Date.now(), trackName: `${artistName} - ${trackName}`, stage: "searching", progress: 0 };
+    
     const searchResults = await ytSearch(`${artistName} ${trackName}`);
     console.log(`[/download] YouTube search complete, found ${searchResults.videos?.length || 0} videos`);
     
     const video = searchResults.videos[0];
-    if (!video) return res.status(404).json({ success: false, error: "No matching audio on YouTube" });
+    if (!video) {
+      delete downloadProgress[id];
+      return res.status(404).json({ success: false, error: "No matching audio on YouTube" });
+    }
     console.log(`[/download] Found video: ${video.title}`);
+
+    // Estimate file size based on duration (audio ~128kbps = ~16KB/s)
+    const estimatedDurationSec = video.duration?.seconds || track.duration_ms / 1000 || 180;
+    const estimatedSizeBytes = estimatedDurationSec * 16000;
+    downloadProgress[id].stage = "downloading";
+    downloadProgress[id].totalBytes = estimatedSizeBytes;
+    downloadProgress[id].downloadedBytes = 0;
 
     if (artworkUrl) {
       try { artworkPath = `/tmp/artwork_${id}.jpg`; await downloadFile(artworkUrl, artworkPath); console.log(`[/download] Artwork downloaded`); } catch (e) { console.log(`[/download] Artwork download failed: ${e.message}`); }
@@ -851,15 +894,26 @@ app.post("/download", requireApiKey, async (req, res) => {
     
     if (!ok) {
       console.log(`[/download] Download failed: ${JSON.stringify(results)}`);
-      return res.status(502).json({
+      downloadProgress[id].stage = "failed";
+      downloadProgress[id].error = (results || []).map((r) => `[${r.method}]: ${r.error}`).join(" | ");
+      const errorResponse = {
         success: false,
-        error: (results || []).map((r) => `[${r.method}]: ${r.error}`).join(" | "),
+        error: downloadProgress[id].error,
         video: { title: video.title, url: video.url },
         hasPoToken: !!cachedPoToken,
         hasProxy: !!process.env.YOUTUBE_PROXY,
         hasCookies: !!getCookieFile(),
-      });
+      };
+      delete downloadProgress[id];
+      return res.status(502).json(errorResponse);
     }
+    
+    // Check actual file size
+    if (fs.existsSync(rawFile)) {
+      downloadProgress[id].downloadedBytes = fs.statSync(rawFile).size;
+      downloadProgress[id].progress = 100;
+    }
+    downloadProgress[id].stage = "processing";
     console.log(`[/download] Processing tags...`);
 
     taggedFile = `/tmp/sidecut_tagged_${id}_${Date.now()}.mp3`;
@@ -868,19 +922,29 @@ app.post("/download", requireApiKey, async (req, res) => {
     catch (e) { fs.copyFileSync(rawFile, taggedFile); }
 
     const safeFileName = `${artistName} - ${trackName}`.replace(/[^\w\s\-]/g, "_").trim();
+    downloadProgress[id].stage = "streaming";
     res.setHeader("Content-Type", "audio/mpeg");
     res.setHeader("Content-Disposition", `attachment; filename="${safeFileName}.mp3"`);
     const fileStream = fs.createReadStream(taggedFile);
     fileStream.pipe(res);
-    fileStream.on("end", () => cleanup());
+    fileStream.on("end", () => {
+      cleanup();
+      delete downloadProgress[id];
+    });
     fileStream.on("error", () => {
       if (!res.headersSent) res.status(500).json({ success: false, error: "Stream error" });
       cleanup();
+      delete downloadProgress[id];
     });
-    req.on("close", () => cleanup());
+    req.on("close", () => {
+      cleanup();
+      delete downloadProgress[id];
+    });
   } catch (error) {
     console.error("[/download] error:", error.message);
+    downloadProgress[id] = { stage: "failed", error: error.message };
     cleanup();
+    delete downloadProgress[id];
     if (!res.headersSent) res.status(500).json({ success: false, error: "Download failed: " + error.message });
   }
   function cleanup() {
